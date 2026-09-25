@@ -44,8 +44,53 @@ const createUser = async (req, res) => {
     });
 };
 
+const updateUser = async (req, res) => {
+    const { id } = req.params;
+    const { name, role } = req.body;
+
+    const result = await pool.query(
+        `UPDATE USERS
+         SET name = $1 , role = $2 , updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3
+         RETURNING id,name,email,role`,
+        [name, role, id]
+    );
+
+    if (result.rows.length === 0) {
+        return res.status(404).json({
+            message: "User not found",
+        });
+    }
+
+    res.json({
+        user: result.rows[0],
+    });
+};
+
+const deleteUser = async (req, res) => {
+    const { id } = req.params;
+
+    const result = await pool.query(
+        "DELETE FROM users WHERE id = $1 RETURNING id, name, email, role",
+        [id]
+    );
+
+    if (result.rows.length === 0) {
+        return res.status(404).json({
+            message: "User not found",
+        });
+    }
+
+    res.json({
+        message: "User deleted successfully",
+        user: result.rows[0],
+    });
+};
+
 module.exports = {
     getUsers,
     getUserById,
     createUser,
+    updateUser,
+    deleteUser,
 };

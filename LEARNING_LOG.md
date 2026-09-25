@@ -2661,3 +2661,1035 @@ git push
 ```
 
 Once that's pushed, **we'll continue from the next step rather than revisiting these PostgreSQL basics**.
+
+
+Ah yes — you mean **only the learning-log entries since the last learning-log commit**, not a rewrite of the entire project.
+
+Based on what we did after that commit, the new material is:
+
+1. `INNER JOIN` in the SeatVault API
+2. Joining `events`, `event_seats`, and `seats`
+3. Filtering available seats
+4. Building `GET /api/events/:eventId/seats`
+5. PostgreSQL transactions: `BEGIN`, `COMMIT`, `ROLLBACK`
+6. Why transactions need a dedicated `client`
+7. Row-level locking with `SELECT ... FOR UPDATE`
+8. Observing lock blocking with two PostgreSQL sessions
+9. Implementing the first transaction-based seat hold API
+10. Testing the race-condition protection through Postman
+11. Understanding why an uncommitted transaction can make another request wait
+12. Verifying the resulting `event_seats` state
+
+Here is the **only new section** you should append to `LEARNING_LOG.md`:
+
+````md
+# Learning Log — SeatVault
+
+## New Learning Checkpoint — JOINs, Transactions, Row Locks & Seat Holds
+
+### Date
+25 September 2026
+
+---
+
+# 1. PostgreSQL JOINs in the SeatVault Domain
+
+Before implementing the seat availability API, I learned how PostgreSQL JOINs allow related data to be retrieved from multiple relational tables.
+
+SeatVault uses separate tables for:
+
+- `events`
+- `seats`
+- `event_seats`
+
+The relationship is:
+
+```text
+events
+   │
+   │ event_id
+   ▼
+event_seats
+   │
+   │ seat_id
+   ▼
+seats
+````
+
+`event_seats` connects a particular event with a physical seat.
+
+---
+
+## 1.1 Joining Events and Venues
+
+Example:
+
+```sql
+SELECT
+    events.name AS event_name,
+    venues.name AS venue_name,
+    venues.city
+FROM events
+JOIN venues
+    ON events.venue_id = venues.id;
+```
+
+This combines information from the `events` and `venues` tables.
+
+The important part is:
+
+```sql
+ON events.venue_id = venues.id
+```
+
+The JOIN follows the foreign-key relationship between the two tables.
+
+---
+
+## 1.2 Joining Event Seats and Physical Seats
+
+Example:
+
+```sql
+SELECT
+    event_seats.id,
+    seats.section,
+    seats.row_label,
+    seats.seat_number
+FROM event_seats
+JOIN seats
+    ON event_seats.seat_id = seats.id;
+```
+
+This allows the application to convert an `event_seats.seat_id` into meaningful physical seat information such as:
+
+```text
+Section A
+Row 1
+Seat 1
+```
+
+---
+
+## 1.3 Three-Table JOIN
+
+I then used three related tables together:
+
+```sql
+SELECT
+    events.name AS event_name,
+    seats.section,
+    seats.row_label,
+    seats.seat_number,
+    event_seats.price,
+    event_seats.status
+FROM event_seats
+JOIN events
+    ON event_seats.event_id = events.id
+JOIN seats
+    ON event_seats.seat_id = seats.id;
+```
+
+This produces a useful representation of the event's seat inventory.
+
+The data comes from different tables:
+
+```text
+events
+→ event name
+
+seats
+→ physical seat location
+
+event_seats
+→ event-specific price and availability status
+```
+
+This demonstrates an important relational database concept:
+
+> Data does not need to be duplicated across tables. Related information can be combined when querying using JOINs.
+
+---
+
+# 2. Filtering Joined Data
+
+I learned that JOINs can be combined with `WHERE`.
+
+For example:
+
+```sql
+SELECT
+    events.name AS event_name,
+    seats.section,
+    seats.row_label,
+    seats.seat_number,
+    event_seats.price,
+    event_seats.status
+FROM event_seats
+JOIN events
+    ON event_seats.event_id = events.id
+JOIN seats
+    ON event_seats.seat_id = seats.id
+WHERE event_seats.event_id = $1
+  AND event_seats.status = 'available';
+```
+
+The query:
+
+1. Finds event seats belonging to the requested event.
+2. Joins them with the event information.
+3. Joins them with physical seat information.
+4. Keeps only seats whose status is `available`.
+
+---
+
+# 3. Seat Availability API
+
+I implemented:
+
+```http
+GET /api/events/:eventId/seats
+```
+
+Example:
+
+```http
+GET /api/events/1/seats
+```
+
+The route is:
+
+```js
+router.get("/:eventId/seats", getAvailableSeats);
+```
+
+The controller uses the PostgreSQL JOIN query to retrieve available seats.
+
+Current controller logic:
+
+```js
+const getAvailableSeats = async (req, res) => {
+    const { eventId } = req.params;
+
+    const result = await pool.query(
+        `SELECT
+            events.name AS event_name,
+            seats.section,
+            seats.row_label,
+            seats.seat_number,
+            event_seats.price,
+            event_seats.status
+         FROM event_seats
+         JOIN events
+            ON event_seats.event_id = events.id
+         JOIN seats
+            ON event_seats.seat_id = seats.id
+         WHERE event_seats.event_id = $1
+           AND event_seats.status = 'available'`,
+        [eventId]
+    );
+
+    res.json({
+        event: result.rows.length > 0
+            ? result.rows[0].event_name
+            : null,
+        availableSeats: result.rows,
+    });
+};
+```
+
+Testing through Postman returned the available seats for:
+
+```text
+Mumbai Music Night
+```
+
+The API correctly returned the seven available seats before a seat was held.
+
+---
+
+# 4. Important New Concept — Database Transactions
+
+The next major concept was PostgreSQL transactions.
+
+A transaction groups multiple database operations into one logical unit.
+
+The basic structure is:
+
+```sql
+BEGIN;
+
+-- database operations
+
+COMMIT;
+```
+
+If something goes wrong:
+
+```sql
+ROLLBACK;
+```
+
+---
+
+## 4.1 BEGIN
+
+```sql
+BEGIN;
+```
+
+starts a transaction.
+
+Operations performed after `BEGIN` belong to that transaction until either:
+
+```sql
+COMMIT;
+```
+
+or:
+
+```sql
+ROLLBACK;
+```
+
+is executed.
+
+---
+
+## 4.2 COMMIT
+
+```sql
+COMMIT;
+```
+
+permanently saves the changes made during the transaction.
+
+Example:
+
+```sql
+BEGIN;
+
+UPDATE event_seats
+SET status = 'booked'
+WHERE id = 1;
+
+COMMIT;
+```
+
+The update becomes permanent.
+
+---
+
+## 4.3 ROLLBACK
+
+```sql
+ROLLBACK;
+```
+
+undoes the changes made during the current transaction.
+
+I tested this manually:
+
+```sql
+BEGIN;
+
+UPDATE event_seats
+SET status = 'booked'
+WHERE id = 1;
+
+ROLLBACK;
+```
+
+After the rollback, the seat returned to:
+
+```text
+available
+```
+
+This demonstrated that changes made inside a transaction can be undone before the transaction is committed.
+
+---
+
+# 5. Why Transactions Matter for Seat Booking
+
+A booking operation involves multiple database operations.
+
+For example:
+
+```text
+Create booking
+     ↓
+Add seats to booking
+     ↓
+Change seat status
+     ↓
+Create payment
+     ↓
+Confirm booking
+```
+
+If one operation fails, we do not want only some of the changes to remain.
+
+For example:
+
+```text
+Create booking       ✅
+Add booking seat     ✅
+Update seat          ❌
+```
+
+Without a transaction, the database could be left in an inconsistent state.
+
+Transactions allow related operations to succeed or fail together.
+
+---
+
+# 6. Concurrency Problem — Double Booking
+
+The most important problem in SeatVault is concurrent booking.
+
+Suppose Seat 1 is:
+
+```text
+status = available
+```
+
+Two users request the same seat at approximately the same time.
+
+A naive implementation could behave like:
+
+```text
+User A → check seat → available
+
+User B → check seat → available
+
+User A → book seat
+
+User B → book seat
+```
+
+Both users may observe the seat as available before either one updates it.
+
+This creates the possibility of:
+
+```text
+Seat 1
+  ↓
+Booking A
+Booking B
+```
+
+This is a double-booking problem.
+
+SeatVault needs database-level concurrency control to prevent this.
+
+---
+
+# 7. Row-Level Locking with SELECT FOR UPDATE
+
+I learned:
+
+```sql
+SELECT ...
+FOR UPDATE;
+```
+
+`FOR UPDATE` places a row-level lock on the selected rows.
+
+Example:
+
+```sql
+SELECT id, status
+FROM event_seats
+WHERE id = 1
+FOR UPDATE;
+```
+
+This means the selected row is locked for the duration of the transaction.
+
+The lock is released when the transaction finishes with:
+
+```sql
+COMMIT;
+```
+
+or:
+
+```sql
+ROLLBACK;
+```
+
+---
+
+# 8. Practical Row-Lock Experiment
+
+I tested row locking using two separate PostgreSQL sessions.
+
+### Terminal A
+
+```sql
+BEGIN;
+
+SELECT id, status
+FROM event_seats
+WHERE id = 1
+FOR UPDATE;
+```
+
+Seat 1 became locked by Terminal A.
+
+### Terminal B
+
+```sql
+BEGIN;
+
+SELECT id, status
+FROM event_seats
+WHERE id = 1
+FOR UPDATE;
+```
+
+Terminal B did not immediately receive the row.
+
+It waited because Terminal A was holding the row lock.
+
+Conceptually:
+
+```text
+Terminal A
+    ↓
+FOR UPDATE
+    ↓
+Seat 1 🔒
+```
+
+while:
+
+```text
+Terminal B
+    ↓
+FOR UPDATE
+    ↓
+WAITING
+```
+
+After Terminal A executed:
+
+```sql
+COMMIT;
+```
+
+the lock was released and Terminal B could continue.
+
+This demonstrated row-level locking practically rather than only theoretically.
+
+---
+
+# 9. Important Understanding of Row Locks
+
+`FOR UPDATE` does not lock the entire `event_seats` table.
+
+If:
+
+```sql
+WHERE id = 1
+FOR UPDATE;
+```
+
+is used, the relevant row is locked.
+
+Conceptually:
+
+```text
+Seat 1 → 🔒 locked
+Seat 2 → available for other transactions
+Seat 3 → available for other transactions
+Seat 4 → available for other transactions
+```
+
+This allows different users to work with different seats concurrently.
+
+---
+
+# 10. PostgreSQL Transactions in Node.js
+
+For a multi-step transaction in Node.js, I learned that a dedicated PostgreSQL client should be obtained from the connection pool.
+
+Example:
+
+```js
+const client = await pool.connect();
+```
+
+Then all operations belonging to the transaction should use that same client:
+
+```js
+await client.query("BEGIN");
+
+await client.query(...);
+
+await client.query(...);
+
+await client.query("COMMIT");
+```
+
+The basic pattern is:
+
+```js
+const client = await pool.connect();
+
+try {
+    await client.query("BEGIN");
+
+    // transaction operations
+
+    await client.query("COMMIT");
+} catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+} finally {
+    client.release();
+}
+```
+
+---
+
+# 11. Why pool.connect() Is Used
+
+A transaction needs to remain on the same PostgreSQL connection.
+
+Therefore, instead of doing:
+
+```js
+pool.query("BEGIN");
+pool.query("...");
+pool.query("COMMIT");
+```
+
+for a transaction, we use:
+
+```js
+const client = await pool.connect();
+```
+
+and then:
+
+```js
+client.query(...)
+```
+
+for every operation inside that transaction.
+
+At the end:
+
+```js
+client.release();
+```
+
+returns the connection to the pool.
+
+---
+
+# 12. First Seat Hold Transaction
+
+I implemented the first transaction-based seat-holding operation.
+
+Endpoint:
+
+```http
+POST /api/events/:eventId/seats/:eventSeatId/hold
+```
+
+Example:
+
+```http
+POST /api/events/1/seats/1/hold
+```
+
+The controller follows this flow:
+
+```text
+BEGIN
+  ↓
+SELECT seat FOR UPDATE
+  ↓
+Check whether seat exists
+  ↓
+Check whether status is available
+  ↓
+UPDATE status → held
+  ↓
+COMMIT
+```
+
+Implementation:
+
+```js
+const holdSeat = async (req, res) => {
+    const { eventSeatId } = req.params;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query("BEGIN");
+
+        const result = await client.query(
+            `SELECT id, status, price
+             FROM event_seats
+             WHERE id = $1
+             FOR UPDATE`,
+            [eventSeatId]
+        );
+
+        if (result.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            return res.status(404).json({
+                message: "Seat not found",
+            });
+        }
+
+        const seat = result.rows[0];
+
+        if (seat.status !== "available") {
+            await client.query("ROLLBACK");
+
+            return res.status(409).json({
+                message: "Seat is not available",
+            });
+        }
+
+        await client.query(
+            `UPDATE event_seats
+             SET status = 'held',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1`,
+            [eventSeatId]
+        );
+
+        await client.query("COMMIT");
+
+        res.json({
+            message: "Seat held successfully",
+            seat: {
+                id: seat.id,
+                price: seat.price,
+                status: "held",
+            },
+        });
+
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+
+    } finally {
+        client.release();
+    }
+};
+```
+
+---
+
+# 13. Why FOR UPDATE Is Used Before the Status Check
+
+The important sequence is:
+
+```sql
+SELECT id, status, price
+FROM event_seats
+WHERE id = $1
+FOR UPDATE;
+```
+
+followed by:
+
+```js
+if (seat.status !== "available") {
+    ...
+}
+```
+
+The row is locked before we make the decision to modify it.
+
+This prevents another transaction from simultaneously modifying the same seat while our transaction is deciding whether it can be held.
+
+---
+
+# 14. Why the Client Does Not Send the Price
+
+The request only contains the seat identifier:
+
+```text
+eventSeatId
+```
+
+The server retrieves the actual price from PostgreSQL:
+
+```sql
+SELECT id, status, price
+FROM event_seats
+WHERE id = $1
+FOR UPDATE;
+```
+
+The client should not be trusted to provide the price.
+
+For example, we do not allow the client to send:
+
+```json
+{
+    "price": 1
+}
+```
+
+for a seat that actually costs:
+
+```text
+499.00
+```
+
+The database remains the source of truth for the seat price.
+
+---
+
+# 15. Testing the Seat Hold API
+
+Using Postman:
+
+```http
+POST http://localhost:3000/api/events/1/seats/1/hold
+```
+
+The first request returned:
+
+```json
+{
+    "message": "Seat held successfully",
+    "seat": {
+        "id": "1",
+        "price": "499.00",
+        "status": "held"
+    }
+}
+```
+
+The second attempt to hold the same seat returned:
+
+```json
+{
+    "message": "Seat is not available"
+}
+```
+
+with HTTP status:
+
+```text
+409 Conflict
+```
+
+This demonstrated that the database state changed from:
+
+```text
+available
+```
+
+to:
+
+```text
+held
+```
+
+and subsequent attempts were rejected.
+
+---
+
+# 16. Debugging a Hanging Request
+
+During testing, the Postman request initially kept loading.
+
+The reason was related to the row-lock experiment performed earlier.
+
+A PostgreSQL transaction that has acquired a `FOR UPDATE` lock can continue holding that lock until the transaction ends.
+
+If the transaction is left open:
+
+```text
+BEGIN
+   ↓
+FOR UPDATE
+   ↓
+lock remains active
+```
+
+another transaction attempting:
+
+```sql
+FOR UPDATE
+```
+
+on the same row can wait.
+
+The issue was resolved by ending the old PostgreSQL transactions with:
+
+```sql
+ROLLBACK;
+```
+
+This was an important practical demonstration of why transactions must always be properly completed.
+
+---
+
+# 17. Verifying the Database State
+
+After the Postman request, I inspected the complete `event_seats` table:
+
+```sql
+SELECT
+    id,
+    event_id,
+    seat_id,
+    price,
+    status,
+    created_at,
+    updated_at
+FROM event_seats
+ORDER BY id;
+```
+
+The important result was:
+
+```text
+id | event_id | seat_id | price  | status
+---+----------+---------+--------+-----------
+1  |    1     |    1    | 499.00 | held
+2  |    1     |    2    | 499.00 | available
+3  |    1     |    3    | 499.00 | available
+4  |    1     |    4    | 499.00 | available
+5  |    1     |    5    | 499.00 | available
+6  |    1     |    6    | 799.00 | available
+7  |    1     |    7    | 799.00 | available
+```
+
+This confirmed that the Postman request successfully changed Seat 1 from:
+
+```text
+available → held
+```
+
+---
+
+# 18. Current Understanding
+
+At this point, I understand the difference between a simple database update and a concurrency-safe operation.
+
+Simple approach:
+
+```text
+Check seat
+   ↓
+Update seat
+```
+
+Concurrency-safe approach:
+
+```text
+BEGIN
+   ↓
+SELECT ... FOR UPDATE
+   ↓
+Check status
+   ↓
+Update seat
+   ↓
+COMMIT
+```
+
+The second approach allows PostgreSQL to coordinate concurrent requests trying to modify the same seat.
+
+---
+
+# 19. Important Limitation of the Current Implementation
+
+The current `held` state is permanent unless another operation changes it.
+
+Currently:
+
+```text
+available
+   ↓
+held
+```
+
+There is no expiration mechanism yet.
+
+In a real ticket-booking flow, a temporary hold should eventually work like:
+
+```text
+available
+    ↓
+held temporarily
+    ↓
+payment successful
+    ↓
+booked
+```
+
+or:
+
+```text
+available
+    ↓
+held temporarily
+    ↓
+payment abandoned / timeout
+    ↓
+available
+```
+
+This will later lead to the Redis TTL-based hold system.
+
+However, Redis will be introduced after the database booking transaction is properly implemented.
+
+---
+
+# 20. Next Learning Step
+
+The next step is to replace the current experimental seat hold with a proper booking transaction involving:
+
+```text
+bookings
+booking_seats
+event_seats
+```
+
+The transaction will eventually perform operations such as:
+
+```text
+BEGIN
+   ↓
+Lock selected event seat(s)
+   ↓
+Verify availability
+   ↓
+Create booking
+   ↓
+Create booking_seats rows
+   ↓
+Update event_seats
+   ↓
+COMMIT
+```
+
+This will be the first complete relational transaction in SeatVault.
+
+````
+
+### Commit this checkpoint
+
+After updating `LEARNING_LOG.md`:
+
+```bash
+git status
+````
+
+
