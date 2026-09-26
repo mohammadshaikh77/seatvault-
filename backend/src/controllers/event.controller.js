@@ -91,7 +91,119 @@ const holdSeat = async (req, res) => {
     }
 };
 
+const createBooking = async (req, res) => {
+    const { eventId } = req.params;
+    const { userId, seatIds } = req.body;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query("BEGIN");
+
+        const sortedSeatIds = [...seatIds].sort((a, b) => a - b);
+
+        const result = await client.query(
+            `SELECT id, seat_id, price, status
+             FROM event_seats
+             WHERE event_id = $1
+               AND seat_id = ANY($2)
+             ORDER BY seat_id
+             FOR UPDATE`,
+            [eventId, sortedSeatIds]
+        );
+
+        if (result.rows.length !== sortedSeatIds.length) {
+            await client.query("ROLLBACK");
+
+            return res.status(404).json({
+                message: "One or more seats do not belong to this event",
+            });
+        }
+
+        const unavailableSeat = result.rows.find(
+            (seat) => seat.status !== "available"
+        );
+
+        if (unavailableSeat) {
+            await client.query("ROLLBACK");
+
+            return res.status(409).json({
+                message: "One or more seats are not available",
+                seatId: unavailableSeat.seat_id,
+                status: unavailableSeat.status,
+            });
+        }
+
+        let totalAmount = 0;
+
+        for (let i = 0; i < result.rows.length; i++) {
+          totalAmount += Number(result.rows[i].price);
+        }
+
+        console.log(totalAmount);  
+
+
+        const bookingResult = await client.query(
+        `INSERT INTO bookings (
+        user_id,
+        event_id,
+        total_amount,
+        status
+       )
+       VALUES ($1, $2, $3, 'pending')
+       RETURNING id, user_id, event_id, total_amount, status`,
+       [userId, eventId, totalAmount]
+       );
+
+       const booking = bookingResult.rows[0];
+
+       console.log("Created booking:", booking);
+
+       for (const seat of result.rows) {
+          await client.query(
+          `INSERT INTO booking_seats (
+            booking_id,
+            event_seat_id,
+            price_at_booking
+           )
+         VALUES ($1, $2, $3)`,
+        [
+            booking.id,
+            seat.id,
+            seat.price,
+        ]
+    );
+}
+
+    await client.query(
+    `UPDATE event_seats
+     SET status = 'held',
+         updated_at = CURRENT_TIMESTAMP
+     WHERE event_id = $1
+       AND seat_id = ANY($2)`,
+    [eventId, sortedSeatIds]
+);
+
+        console.log("All seats are available:", result.rows);
+
+        await client.query("COMMIT");
+
+    res.json({
+    message: "Booking and booking seats created",
+    booking,
+    seats: result.rows,
+});
+
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+
+    } finally {
+        client.release();
+    }
+};
 module.exports = {
     getAvailableSeats,
     holdSeat,
+    createBooking,
 };
