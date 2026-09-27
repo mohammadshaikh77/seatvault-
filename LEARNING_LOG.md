@@ -5276,3 +5276,1317 @@ git push
 ```
 
 This is now a clean checkpoint before we start the **Redis + temporary hold** phase.
+
+
+Yes — **this is a good point to commit.** We have completed a clean learning milestone:
+
+> **Redis fundamentals + Node.js Redis integration + BullMQ delayed-job basics**
+
+We should commit now before connecting BullMQ to the actual booking flow. That way, if something goes wrong later, we have a clean checkpoint.
+
+And yes, I'll keep this log to **only what we learned after the previous commit**. No repetition of PostgreSQL/JOIN/concurrency material.
+
+Replace/append the following section in your `LEARNING_LOG.md`:
+
+````md
+# Learning Log — SeatVault
+
+## New Learning Checkpoint — Redis & BullMQ
+
+### Date
+27 September 2026
+
+---
+
+# 1. Introduction to Redis
+
+Redis was introduced as a new technology for SeatVault.
+
+Redis is an in-memory data store that can be used for:
+
+- Temporary data
+- Caching
+- Counters
+- Sessions
+- Queues
+- Rate limiting
+- Temporary locks
+- Data with expiration
+
+For SeatVault, the first use case is:
+
+> Managing temporary seat-hold information and expiration.
+
+---
+
+# 2. PostgreSQL vs Redis
+
+The important architectural distinction is:
+
+```text
+PostgreSQL
+    ↓
+Permanent application data
+
+Redis
+    ↓
+Temporary / fast-access data
+````
+
+PostgreSQL remains the **source of truth** for SeatVault.
+
+PostgreSQL stores things such as:
+
+```text
+users
+events
+seats
+event_seats
+bookings
+booking_seats
+payments
+tickets
+```
+
+Redis will be used for temporary information such as:
+
+```text
+temporary seat holds
+TTL
+queue information
+```
+
+The architecture is therefore:
+
+```text
+                    SeatVault
+                       │
+              ┌────────┴────────┐
+              ↓                 ↓
+        PostgreSQL            Redis
+              │                 │
+       permanent data     temporary data
+       source of truth        TTL/queues
+```
+
+---
+
+# 3. Installing Redis
+
+Redis was installed locally on macOS using Homebrew:
+
+```bash
+brew install redis
+```
+
+Redis version was verified using:
+
+```bash
+redis-server --version
+```
+
+---
+
+# 4. Running Redis
+
+Redis server was started using:
+
+```bash
+redis-server
+```
+
+The server runs locally on the default Redis port:
+
+```text
+localhost:6379
+```
+
+The Redis CLI was opened using:
+
+```bash
+redis-cli
+```
+
+The CLI showed:
+
+```text
+127.0.0.1:6379>
+```
+
+This confirmed that the Redis server was running and the CLI successfully connected to it.
+
+---
+
+# 5. Redis Key-Value Model
+
+Redis was learned using a simple key-value model.
+
+Example:
+
+```text
+key       value
+----------------
+name      Mohammad
+```
+
+The equivalent mental model in JavaScript is similar to:
+
+```js
+const data = {
+    name: "Mohammad"
+};
+```
+
+Redis is more powerful than a JavaScript object, but this is a useful beginner mental model.
+
+---
+
+# 6. Basic Redis Commands
+
+The following commands were practiced manually using `redis-cli`.
+
+## SET
+
+```text
+SET name Mohammad
+```
+
+Stores:
+
+```text
+name → Mohammad
+```
+
+---
+
+## GET
+
+```text
+GET name
+```
+
+Retrieves:
+
+```text
+"Mohammad"
+```
+
+---
+
+## DEL
+
+```text
+DEL name
+```
+
+Deletes the key.
+
+Redis returned:
+
+```text
+(integer) 1
+```
+
+meaning one key was successfully deleted.
+
+Afterward:
+
+```text
+GET name
+```
+
+returned:
+
+```text
+(nil)
+```
+
+meaning the key no longer existed.
+
+---
+
+# 7. Redis TTL
+
+TTL means:
+
+> Time To Live
+
+TTL defines how long a Redis key should remain alive before Redis automatically removes it.
+
+Example:
+
+```text
+SET message hello EX 30
+```
+
+means:
+
+```text
+key   = message
+value = hello
+TTL   = 30 seconds
+```
+
+Redis automatically removes the key after the TTL expires.
+
+---
+
+# 8. Checking TTL
+
+The remaining lifetime of a key can be checked with:
+
+```text
+TTL message
+```
+
+Example output:
+
+```text
+(integer) 23
+```
+
+means approximately 23 seconds remain.
+
+During the experiment, the TTL decreased:
+
+```text
+23
+22
+20
+8
+1
+-2
+```
+
+When it reached:
+
+```text
+-2
+```
+
+the key no longer existed because Redis had automatically expired it.
+
+Important TTL meanings:
+
+```text
+positive number
+    ↓
+key exists and has that many seconds remaining
+
+-1
+    ↓
+key exists but has no expiration
+
+-2
+    ↓
+key does not exist
+```
+
+---
+
+# 9. Redis TTL vs Manual Deletion
+
+There are two different ways a key can disappear.
+
+### Manual deletion
+
+```text
+DEL message
+```
+
+The application/user explicitly deletes the key.
+
+### Automatic expiration
+
+```text
+SET message hello EX 30
+```
+
+Redis automatically removes the key after 30 seconds.
+
+For SeatVault, automatic expiration is important because seat holds should not remain forever.
+
+---
+
+# 10. Redis Temporary Seat Hold Concept
+
+The eventual SeatVault Redis key structure was designed as:
+
+```text
+hold:event:1:seat:2
+```
+
+The key can store information such as:
+
+```text
+hold:event:1:seat:2 → booking:3
+```
+
+This means conceptually:
+
+> Booking 3 currently has a temporary hold associated with Seat 2 for Event 1.
+
+A TTL can be attached:
+
+```text
+hold:event:1:seat:2 → booking:3
+TTL → 600 seconds
+```
+
+The `:` characters are simply part of the key naming convention.
+
+They make Redis keys easier to organize and understand.
+
+---
+
+# 11. Important Redis/PostgreSQL Architecture Issue
+
+Redis expiration does not automatically update PostgreSQL.
+
+For example:
+
+```text
+Redis
+hold:event:1:seat:2 → booking:3
+TTL expires
+        ↓
+key disappears
+```
+
+But PostgreSQL could still contain:
+
+```text
+event_seats
+seat 2 → held
+```
+
+Therefore:
+
+```text
+Redis
+   ↓
+temporary hold expires
+
+PostgreSQL
+   ↓
+still says held
+```
+
+Something must connect these two systems and release the PostgreSQL seat.
+
+This led to the next concept:
+
+> Delayed jobs.
+
+---
+
+# 12. Connecting Redis to Node.js
+
+The Node.js Redis client package was installed:
+
+```bash
+npm install redis
+```
+
+A Redis configuration file was created:
+
+```text
+backend/src/config/redis.js
+```
+
+The Redis client was created using:
+
+```js
+const { createClient } = require("redis");
+
+const redisClient = createClient({
+    url: "redis://localhost:6379",
+});
+```
+
+---
+
+# 13. Redis Connection Events
+
+An error listener was added:
+
+```js
+redisClient.on("error", (error) => {
+    console.error("Redis error:", error);
+});
+```
+
+A connection listener was added:
+
+```js
+redisClient.on("connect", () => {
+    console.log("Redis se connection ban gaya");
+});
+```
+
+A ready listener was also added:
+
+```js
+redisClient.on("ready", () => {
+    console.log("Redis ready — commands bhej sakte ho");
+});
+```
+
+The distinction was learned:
+
+```text
+connect
+    ↓
+Redis connection established
+
+ready
+    ↓
+Redis client is ready to execute commands
+```
+
+---
+
+# 14. Connecting Redis During Server Startup
+
+The Redis connection function:
+
+```js
+const connectRedis = async () => {
+    await redisClient.connect();
+
+    console.log("Redis connected (from connectRedis function)");
+};
+```
+
+was called from `server.js`.
+
+The startup flow is now:
+
+```text
+Node.js starts
+      ↓
+connectDB()
+      ↓
+PostgreSQL connected
+      ↓
+connectRedis()
+      ↓
+Redis connected
+      ↓
+Express starts
+```
+
+The server successfully printed:
+
+```text
+PostgreSQL connected
+Redis se connection ban gaya
+Redis ready — commands bhej sakte ho
+Redis connected (from connectRedis function)
+SeatVault server running on port 3000
+```
+
+---
+
+# 15. Testing Redis Connection From Node.js
+
+Redis connectivity was tested using:
+
+```js
+const response = await redisClient.ping();
+
+console.log("redis response:", response);
+```
+
+Redis returned:
+
+```text
+PONG
+```
+
+This confirmed:
+
+```text
+Node.js
+   ↓
+Redis client
+   ↓
+Redis server
+   ↓
+PONG
+```
+
+---
+
+# 16. Redis SET and GET From Node.js
+
+Redis operations were then performed directly from Node.js.
+
+### SET
+
+```js
+await redisClient.set("name", "Mohammad");
+```
+
+This is the programmatic equivalent of:
+
+```text
+SET name Mohammad
+```
+
+### GET
+
+```js
+const name = await redisClient.get("name");
+```
+
+This is the programmatic equivalent of:
+
+```text
+GET name
+```
+
+The test successfully returned:
+
+```text
+Name stored in Redis
+Name from Redis: Mohammad
+```
+
+---
+
+# 17. Redis TTL From Node.js
+
+TTL was then tested from Node.js.
+
+```js
+await redisClient.set("message", "hello", {
+    EX: 30,
+});
+```
+
+This creates:
+
+```text
+message → hello
+TTL → 30 seconds
+```
+
+The remaining TTL can be retrieved using:
+
+```js
+const ttl = await redisClient.ttl("message");
+```
+
+The test successfully returned:
+
+```text
+Message from Redis: hello
+Remaining TTL: 30
+```
+
+This demonstrated that the same Redis TTL functionality available through `redis-cli` can be used programmatically from Node.js.
+
+---
+
+# 18. Redis Key Naming for Seat Holds
+
+Multiple temporary seat-hold keys were tested.
+
+Example:
+
+```js
+await redisClient.set(
+    "hold:event:1:seat:2",
+    "booking:3",
+    {
+        EX: 30,
+    }
+);
+```
+
+and:
+
+```js
+await redisClient.set(
+    "hold:event:1:seat:3",
+    "booking:3",
+    {
+        EX: 30,
+    }
+);
+```
+
+They were retrieved using:
+
+```js
+const seat2 = await redisClient.get(
+    "hold:event:1:seat:2"
+);
+
+const seat3 = await redisClient.get(
+    "hold:event:1:seat:3"
+);
+```
+
+The result was:
+
+```text
+Seat 2 hold: booking:3
+Seat 3 hold: booking:3
+```
+
+This demonstrated that each seat can have its own Redis key and TTL.
+
+---
+
+# 19. Why `setTimeout()` Is Not Enough
+
+A simple JavaScript timer could theoretically be used:
+
+```js
+setTimeout(() => {
+    // release seat
+}, 10 * 60 * 1000);
+```
+
+However, the timer exists inside the Node.js process.
+
+If the server crashes:
+
+```text
+Node.js
+   ↓
+setTimeout()
+   ↓
+server crashes
+   ↓
+timer disappears
+```
+
+The application would lose knowledge of the scheduled work.
+
+This becomes even more problematic when multiple application servers are running.
+
+Therefore, SeatVault needs a persistent job/queue mechanism rather than relying on an in-memory JavaScript timer.
+
+---
+
+# 20. What Is a Job?
+
+A job is a piece of work that needs to be performed.
+
+Examples:
+
+```text
+Send email
+Generate report
+Process image
+Release expired seat
+Process payment
+```
+
+For SeatVault, a job can eventually be:
+
+```text
+Release booking #3 after 10 minutes
+```
+
+---
+
+# 21. What Is a Queue?
+
+A queue stores work that needs to be processed.
+
+Conceptually:
+
+```text
+Producer
+   ↓
+Queue
+   ↓
+Worker
+```
+
+Instead of Node.js waiting for 10 minutes, it adds a job to the queue.
+
+The worker can process the job when it becomes ready.
+
+---
+
+# 22. Producer and Worker
+
+Two important queue concepts were learned.
+
+### Producer
+
+The producer creates/adds jobs.
+
+In SeatVault:
+
+```text
+Booking created
+      ↓
+Node.js
+      ↓
+add expiration job
+```
+
+### Worker
+
+The worker processes jobs.
+
+Eventually:
+
+```text
+Expiration time arrives
+      ↓
+Worker receives job
+      ↓
+Checks booking
+      ↓
+Releases seats if necessary
+```
+
+So:
+
+```text
+Producer
+   ↓
+Queue
+   ↓
+Worker
+```
+
+---
+
+# 23. BullMQ
+
+BullMQ was introduced as the Node.js job queue library for SeatVault.
+
+BullMQ uses Redis to store and manage queue information.
+
+The architecture is:
+
+```text
+Node.js
+   ↓
+BullMQ
+   ↓
+Redis
+```
+
+BullMQ will eventually allow SeatVault to create delayed jobs such as:
+
+```text
+Release booking #3
+after 10 minutes
+```
+
+---
+
+# 24. Installing BullMQ
+
+BullMQ was installed using:
+
+```bash
+npm install bullmq
+```
+
+---
+
+# 25. BullMQ Queue
+
+A queue was created in:
+
+```text
+backend/src/queues/hold.queue.js
+```
+
+using:
+
+```js
+const { Queue } = require("bullmq");
+
+const holdQueue = new Queue("seat-hold", {
+    connection: {
+        host: "localhost",
+        port: 6379,
+    },
+});
+
+module.exports = holdQueue;
+```
+
+The queue is named:
+
+```text
+seat-hold
+```
+
+This queue will eventually contain jobs related to temporary seat holds.
+
+---
+
+# 26. BullMQ Worker
+
+A worker was created in:
+
+```text
+backend/src/workers/hold.worker.js
+```
+
+The worker listens to the:
+
+```text
+seat-hold
+```
+
+queue.
+
+Basic worker structure:
+
+```js
+const { Worker } = require("bullmq");
+
+const holdWorker = new Worker(
+    "seat-hold",
+    async (job) => {
+        console.log("Job received:", job.name);
+        console.log("Job data:", job.data);
+    },
+    {
+        connection: {
+            host: "localhost",
+            port: 6379,
+        },
+    }
+);
+```
+
+The worker waits for jobs and processes them when they become available.
+
+---
+
+# 27. BullMQ `ioredis` Dependency
+
+Initially the worker failed with an error indicating that BullMQ could not load:
+
+```text
+ioredis
+```
+
+The required package was installed:
+
+```bash
+npm install ioredis
+```
+
+This allowed the BullMQ Worker to connect successfully.
+
+Important distinction:
+
+```text
+redis package
+    ↓
+used for normal Redis operations
+
+ioredis
+    ↓
+used by BullMQ worker connection
+```
+
+The existing `redis` package was not replaced.
+
+---
+
+# 28. BullMQ Test Producer
+
+A temporary producer was created:
+
+```text
+backend/src/test-queue.js
+```
+
+It adds a job:
+
+```js
+const job = await holdQueue.add(
+    "test-hold",
+    {
+        message: "Hello from SeatVault",
+    },
+    {
+        delay: 10000,
+    }
+);
+```
+
+The job contains:
+
+```text
+name:
+test-hold
+
+data:
+{
+    message: "Hello from SeatVault"
+}
+
+delay:
+10000 milliseconds
+```
+
+---
+
+# 29. Delayed Jobs
+
+The following:
+
+```js
+delay: 10000
+```
+
+means:
+
+```text
+10,000 milliseconds
+      ↓
+10 seconds
+```
+
+Therefore:
+
+```text
+Producer
+   ↓
+add job
+   ↓
+wait 10 seconds
+   ↓
+Worker receives job
+```
+
+This is called a **delayed job**.
+
+---
+
+# 30. Successful BullMQ Experiment
+
+The worker was started using:
+
+```bash
+node src/workers/hold.worker.js
+```
+
+The producer was started using:
+
+```bash
+node src/test-queue.js
+```
+
+The worker successfully reported:
+
+```text
+Worker ready
+Job received: test-hold
+Job data: { message: 'Hello from SeatVault' }
+```
+
+The producer reported:
+
+```text
+Job added: 1
+```
+
+This confirmed that the complete pipeline works:
+
+```text
+Producer
+    ↓
+BullMQ Queue
+    ↓
+Redis
+    ↓
+Delayed Job
+    ↓
+BullMQ Worker
+    ↓
+Job Processing
+```
+
+---
+
+# 31. Important Queue Persistence Lesson
+
+During the first BullMQ attempt, a job was added before the Worker could successfully start because the `ioredis` dependency was missing.
+
+After `ioredis` was installed and the Worker started, the Worker was able to find and process the existing job.
+
+This demonstrated an important difference from `setTimeout()`:
+
+```text
+setTimeout()
+   ↓
+lives inside Node.js process
+```
+
+whereas:
+
+```text
+BullMQ
+   ↓
+Redis
+   ↓
+job stored outside the Node.js process
+```
+
+Therefore, the Worker can start later and process jobs that were already placed into the queue.
+
+---
+
+# 32. Current SeatVault Architecture
+
+The architecture has now expanded to:
+
+```text
+                         SeatVault
+                            │
+                         Node.js
+                            │
+             ┌──────────────┼──────────────┐
+             │              │              │
+             ▼              ▼              ▼
+        PostgreSQL        Redis          BullMQ
+             │              │              │
+       source of truth   temporary       job queue
+       bookings          holds           delayed jobs
+       seats             TTL
+       payments
+                            │
+                            ▼
+                         Worker
+                            │
+                            ▼
+                       PostgreSQL
+```
+
+The eventual temporary-hold flow will be:
+
+```text
+User selects seat
+       ↓
+PostgreSQL transaction
+       ↓
+Seat → held
+       ↓
+Booking → pending
+       ↓
+Redis temporary hold
+       ↓
+BullMQ delayed expiration job
+       ↓
+10 minutes
+       ↓
+Worker
+       ↓
+Check booking in PostgreSQL
+       ↓
+Still pending?
+     /       \
+   YES        NO
+    ↓          ↓
+release      do nothing
+seat
+```
+
+---
+
+# 33. Important Design Principle
+
+Redis expiration and BullMQ jobs solve different problems.
+
+### Redis TTL
+
+Answers:
+
+> How long should this temporary Redis key exist?
+
+### BullMQ delayed job
+
+Answers:
+
+> When should our application perform some work?
+
+For SeatVault we can use both:
+
+```text
+Redis
+   ↓
+temporary hold + TTL
+
+BullMQ
+   ↓
+delayed expiration work
+```
+
+PostgreSQL remains the source of truth.
+
+---
+
+# 34. Concepts Learned in This Checkpoint
+
+### Redis
+
+* What Redis is
+* Redis server
+* `redis-cli`
+* Redis port `6379`
+* Key-value model
+* `SET`
+* `GET`
+* `DEL`
+* TTL
+* `EX`
+* Redis key naming
+* Redis connection from Node.js
+* `connect` event
+* `ready` event
+* `PING` / `PONG`
+* Redis expiration
+
+### Node.js + Redis
+
+* `redis` package
+* `createClient()`
+* Redis connection URL
+* `redisClient.connect()`
+* `redisClient.set()`
+* `redisClient.get()`
+* `redisClient.ttl()`
+
+### Job Queues
+
+* What a job is
+* What a queue is
+* Producer
+* Worker
+* Delayed job
+* Why `setTimeout()` is insufficient for persistent scheduled work
+
+### BullMQ
+
+* BullMQ
+* Queue creation
+* Worker creation
+* Job data
+* Job name
+* Job ID
+* Delayed jobs
+* Redis as BullMQ's backing store
+* `ioredis` dependency for the Worker
+* Producer → Queue → Redis → Worker flow
+
+---
+
+# 35. Next Learning Step
+
+The next step is to move from the generic test job:
+
+```text
+test-hold
+{
+    message: "Hello from SeatVault"
+}
+```
+
+to a realistic SeatVault expiration job:
+
+```text
+release-hold
+{
+    bookingId: 3
+}
+```
+
+The Worker will eventually:
+
+```text
+receive bookingId
+       ↓
+query PostgreSQL
+       ↓
+check booking status
+       ↓
+if still pending and expired
+       ↓
+release seats
+       ↓
+mark booking expired
+```
+
+Before modifying the actual booking controller, we will first create and understand this realistic job in isolation.
+
+---
+
+# Checkpoint
+
+Redis and BullMQ have been successfully installed, connected, and tested.
+
+The next major integration will be:
+
+```text
+Seat Booking
+     ↓
+Redis Hold
+     ↓
+BullMQ Delayed Job
+     ↓
+Expiration Worker
+     ↓
+PostgreSQL Seat Release
+```
+
+````
+
+### Then commit this checkpoint
+
+First check what actually changed:
+
+```bash
+git status
+````
+
+You should see things around:
+
+```text
+backend/package.json
+backend/package-lock.json
+backend/src/config/redis.js
+backend/src/server.js
+backend/src/queues/hold.queue.js
+backend/src/workers/hold.worker.js
+backend/src/test-queue.js
+LEARNING_LOG.md
+```
+
+Then:
+
+```bash
+git add LEARNING_LOG.md backend/package.json backend/package-lock.json backend/src/config/redis.js backend/src/server.js backend/src/queues/hold.queue.js backend/src/workers/hold.worker.js backend/src/test-queue.js
+```
+
+Commit:
+
+```bash
+git commit -m "feat: add Redis and BullMQ job queue"
+```
+
+And push:
+
+```bash
+git push
+```
+
+**This is a very good checkpoint** because everything up to here is tested independently. Next we can start integrating the queue with the actual SeatVault booking flow.
+
