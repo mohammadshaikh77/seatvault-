@@ -6590,3 +6590,529 @@ git push
 
 **This is a very good checkpoint** because everything up to here is tested independently. Next we can start integrating the queue with the actual SeatVault booking flow.
 
+Absolutely. Since the previous checkpoint already covered the **Redis + BullMQ fundamentals**, this log should only document what we implemented **after that commit**.
+
+Add this to the bottom of `LEARNING_LOG.md`:
+
+````md
+# New Learning Checkpoint — BullMQ Booking Hold Expiration
+
+## What I Implemented
+
+I connected the BullMQ delayed job system with PostgreSQL so that a pending seat booking can automatically expire and release its seats.
+
+The flow is:
+
+```text
+Booking created
+      ↓
+Seats marked as HELD
+      ↓
+BullMQ delayed job created
+      ↓
+Worker receives bookingId
+      ↓
+Worker queries PostgreSQL
+      ↓
+Check current booking status
+      ↓
+If status = pending
+      ↓
+Booking → expired
+      ↓
+Seats → available
+      ↓
+COMMIT
+````
+
+---
+
+## 1. BullMQ Job Carries the Booking ID
+
+Instead of putting the complete booking information inside the BullMQ job, the job only contains the booking ID.
+
+Example:
+
+```js
+const job = await holdQueue.add(
+    "release-hold",
+    {
+        bookingId: 3,
+    },
+    {
+        delay: 10000,
+    }
+);
+```
+
+The worker receives:
+
+```js
+{
+    bookingId: 3
+}
+```
+
+### Why only the ID?
+
+The worker should not depend on potentially outdated data stored inside the job.
+
+Instead:
+
+```text
+BullMQ
+   ↓
+bookingId
+   ↓
+PostgreSQL
+   ↓
+current booking state
+```
+
+This means the worker always checks the latest state of the booking when the job actually executes.
+
+---
+
+# 2. Worker Queries PostgreSQL
+
+The BullMQ worker uses the `bookingId` to find the booking:
+
+```js
+const result = await pool.query(
+    `SELECT id, user_id, event_id, total_amount, status
+     FROM bookings
+     WHERE id = $1`,
+    [bookingId]
+);
+```
+
+For booking `3`, PostgreSQL returned:
+
+```text
+id: 3
+user_id: 1
+event_id: 1
+total_amount: 998.00
+status: pending
+```
+
+This proved that the BullMQ worker can communicate with PostgreSQL and retrieve the current booking state.
+
+---
+
+# 3. Booking Row Locking with FOR UPDATE
+
+Before changing the booking, the worker locks the booking row:
+
+```sql
+SELECT id, user_id, event_id, total_amount, status
+FROM bookings
+WHERE id = $1
+FOR UPDATE;
+```
+
+The transaction structure is:
+
+```js
+await client.query("BEGIN");
+
+const result = await client.query(
+    `SELECT ...
+     FROM bookings
+     WHERE id = $1
+     FOR UPDATE`,
+    [bookingId]
+);
+```
+
+### What `FOR UPDATE` does
+
+It locks the selected booking row until the transaction finishes.
+
+It does NOT lock the entire `bookings` table.
+
+This is important because later the payment process may try to update the same booking.
+
+For example:
+
+```text
+Payment process             Expiration worker
+       ↓                           ↓
+ lock booking 3              lock booking 3
+       ↓                           ↓
+ confirm booking             waits
+```
+
+Only one transaction can acquire the row lock first.
+
+The second transaction waits and then sees the latest booking status.
+
+---
+
+# 4. Checking the Current Booking Status
+
+The worker does not automatically expire every booking.
+
+It checks:
+
+```js
+if (booking.status !== "pending") {
+    console.log(
+        `Booking ${bookingId} is ${booking.status}. No action needed.`
+    );
+
+    await client.query("COMMIT");
+    return;
+}
+```
+
+This is important because the booking might already have been confirmed by the time the expiration job runs.
+
+Example:
+
+```text
+Booking = confirmed
+       ↓
+Expiration job runs
+       ↓
+Worker checks PostgreSQL
+       ↓
+status !== pending
+       ↓
+Do nothing
+```
+
+This prevents an already-confirmed booking from being accidentally expired.
+
+---
+
+# 5. Expiring the Booking
+
+If the booking is still pending:
+
+```sql
+UPDATE bookings
+SET status = 'expired',
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1;
+```
+
+For booking `3`, the database changed:
+
+```text
+pending → expired
+```
+
+Verified result:
+
+```text
+id | user_id | event_id | total_amount | status
+---+---------+----------+--------------+---------
+3  |    1    |     1    |    998.00    | expired
+```
+
+---
+
+# 6. Releasing the Held Seats
+
+The booking's seats are stored in:
+
+```text
+booking_seats
+```
+
+which references:
+
+```text
+event_seats
+```
+
+The worker releases the seats belonging to the booking.
+
+Using PostgreSQL `UPDATE ... FROM`:
+
+```sql
+UPDATE event_seats AS es
+SET status = 'available',
+    updated_at = CURRENT_TIMESTAMP
+FROM booking_seats AS bs
+WHERE es.id = bs.event_seat_id
+  AND bs.booking_id = $1
+  AND es.status = 'held';
+```
+
+### Relationship
+
+```text
+bookings
+   │
+   │ booking_id
+   ↓
+booking_seats
+   │
+   │ event_seat_id
+   ↓
+event_seats
+```
+
+Only the seats belonging to the specific booking are released.
+
+The condition:
+
+```sql
+AND es.status = 'held'
+```
+
+also ensures that only currently held seats are changed.
+
+---
+
+# 7. Entire Expiration Process Uses One Transaction
+
+The worker performs the booking expiration and seat release inside one PostgreSQL transaction:
+
+```js
+await client.query("BEGIN");
+
+// Lock booking
+
+// Check status
+
+// Update booking
+
+// Release seats
+
+await client.query("COMMIT");
+```
+
+If something fails:
+
+```js
+catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+}
+```
+
+This gives us atomic behavior.
+
+Conceptually:
+
+```text
+BEGIN
+   ↓
+Lock booking
+   ↓
+Check booking
+   ↓
+Expire booking
+   ↓
+Release seats
+   ↓
+COMMIT
+```
+
+If an error occurs:
+
+```text
+BEGIN
+   ↓
+Something fails
+   ↓
+ROLLBACK
+   ↓
+Database changes are undone
+```
+
+---
+
+# 8. Why the Transaction Matters
+
+We don't want this situation:
+
+```text
+Booking → expired
+Seats → still held
+```
+
+or:
+
+```text
+Booking → pending
+Seats → available
+```
+
+The booking status update and seat release belong to the same logical operation.
+
+Using one transaction means they are committed together.
+
+---
+
+# 9. PostgreSQL UPDATE JOIN
+
+I also learned that PostgreSQL uses `UPDATE ... FROM` for update operations involving another table.
+
+Instead of:
+
+```sql
+UPDATE event_seats
+SET status = 'available'
+WHERE id IN (
+    SELECT event_seat_id
+    FROM booking_seats
+    WHERE booking_id = $1
+);
+```
+
+we can write:
+
+```sql
+UPDATE event_seats AS es
+SET status = 'available'
+FROM booking_seats AS bs
+WHERE es.id = bs.event_seat_id
+  AND bs.booking_id = $1;
+```
+
+The important PostgreSQL pattern is:
+
+```sql
+UPDATE table1
+SET ...
+FROM table2
+WHERE table1.id = table2.foreign_key;
+```
+
+---
+
+# 10. Final Working Flow
+
+The complete system currently works like this:
+
+```text
+User selects seats
+       ↓
+PostgreSQL transaction
+       ↓
+SELECT seats FOR UPDATE
+       ↓
+Check availability
+       ↓
+Create booking
+       ↓
+Create booking_seats
+       ↓
+Seats → held
+       ↓
+COMMIT
+       ↓
+BullMQ delayed job
+       ↓
+Worker receives bookingId
+       ↓
+Worker starts PostgreSQL transaction
+       ↓
+SELECT booking FOR UPDATE
+       ↓
+Check booking status
+       ↓
+If pending
+       ↓
+Booking → expired
+       ↓
+Seats → available
+       ↓
+COMMIT
+```
+
+---
+
+## 11. Important Learning
+
+The key architecture lesson is:
+
+> **BullMQ decides when the expiration work should run, but PostgreSQL decides what the current truth is.**
+
+BullMQ:
+
+```text
+"When should I run?"
+```
+
+PostgreSQL:
+
+```text
+"What is the current state?"
+```
+
+PostgreSQL remains the source of truth for bookings and seat availability.
+
+---
+
+## 12. Current Limitation
+
+The `bookings` table already has:
+
+```sql
+expires_at TIMESTAMP
+```
+
+but it is currently `NULL`.
+
+The BullMQ test currently uses:
+
+```js
+delay: 10000
+```
+
+which means the job runs after 10 seconds.
+
+The next step will be to connect these concepts properly:
+
+```text
+booking.expires_at
+       ↓
+calculate hold duration
+       ↓
+BullMQ delayed job
+       ↓
+worker
+       ↓
+expire booking
+       ↓
+release seats
+```
+
+For now, the expiration mechanism has been successfully tested using a 10-second demo delay.
+
+---
+
+## Commit
+
+Suggested commit:
+
+```bash
+git add .
+git commit -m "feat: add booking hold expiration worker"
+```
+
+### Checkpoint
+
+At this point I have successfully implemented and tested:
+
+* BullMQ delayed jobs
+* Passing `bookingId` through a queue
+* BullMQ worker querying PostgreSQL
+* PostgreSQL transactions inside workers
+* `SELECT ... FOR UPDATE`
+* Checking current booking status
+* Expiring pending bookings
+* Releasing held seats
+* PostgreSQL `UPDATE ... FROM`
+* Atomic booking expiration + seat release
+* Handling already-processed/non-pending bookings
+
+```
+
+This is the correct checkpoint to commit. **After this commit, the next topic is `expires_at` + dynamically scheduling the BullMQ expiration job.**
+```

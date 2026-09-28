@@ -2,9 +2,9 @@ const holdQueue = require("./queues/hold.queue");
 
 const addTestJob = async () => {
     const job = await holdQueue.add(
-        "test-hold",
+        "release-hold",
         {
-            message: "Hello from SeatVault",
+            bookingId : 3,
         },
         {
             delay: 10000,
