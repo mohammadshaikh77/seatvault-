@@ -1,4 +1,5 @@
 const { pool } = require("../config/db");
+const holdQueue = require("../queues/hold.queue");
 
 const getAvailableSeats = async (req, res) => {
     const { eventId } = req.params;
@@ -144,18 +145,29 @@ const createBooking = async (req, res) => {
 
 
         const bookingResult = await client.query(
-        `INSERT INTO bookings (
+    `INSERT INTO bookings (
         user_id,
         event_id,
         total_amount,
-        status
-       )
-       VALUES ($1, $2, $3, 'pending')
-       RETURNING id, user_id, event_id, total_amount, status`,
-       [userId, eventId, totalAmount]
-       );
+        status,
+        expires_at
+    )
+    VALUES (
+        $1,
+        $2,
+        $3,
+        'pending',
+        CURRENT_TIMESTAMP + INTERVAL '10 minutes'
+    )
+    RETURNING id, user_id, event_id, total_amount, status, expires_at`,
+    [userId, eventId, totalAmount]
+);
 
        const booking = bookingResult.rows[0];
+
+       
+
+    console.log("Booking expires at:", booking.expires_at);
 
        console.log("Created booking:", booking);
 
@@ -187,6 +199,21 @@ const createBooking = async (req, res) => {
         console.log("All seats are available:", result.rows);
 
         await client.query("COMMIT");
+
+        const delayMs =
+    new Date(booking.expires_at).getTime() - Date.now();
+
+     await holdQueue.add(
+    "release-hold",
+    {
+        bookingId: booking.id,
+    },
+    {
+        delay: delayMs,
+    }
+    );
+
+
 
     res.json({
     message: "Booking and booking seats created",

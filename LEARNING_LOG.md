@@ -7115,4 +7115,2131 @@ At this point I have successfully implemented and tested:
 ```
 
 This is the correct checkpoint to commit. **After this commit, the next topic is `expires_at` + dynamically scheduling the BullMQ expiration job.**
+
+
+Absolutely. Here is the **full `LEARNING_LOG.md` up to the latest successful commit**. This includes the earlier PostgreSQL/transactions/Redis/BullMQ learning plus the new automatic booking-expiration integration.
+
+You can replace your current `LEARNING_LOG.md` with this.
+
+````md
+# SeatVault Learning Log
+
+This file documents what I learn and implement while building SeatVault.
+
+The goal is not only to build the project, but to understand the backend concepts behind each feature.
+
+---
+
+# Project
+
+## SeatVault — Event Ticket Booking Platform
+
+SeatVault is a backend-focused event ticket booking platform designed around one important problem:
+
+> How do we allow multiple users to try booking seats concurrently without allowing the same seat to be booked twice?
+
+### Tech Stack
+
+- Node.js
+- Express.js
+- PostgreSQL
+- Redis
+- BullMQ
+- JWT
+- Docker
+- Postman
+- k6 / Artillery
+- Git / GitHub
+
+### Architecture
+
+SeatVault follows a modular monolithic architecture.
+
+Current flow:
+
+```text
+Route
+  ↓
+Controller
+  ↓
+Database / Redis / Queue
+  ↓
+PostgreSQL / Redis
+````
+
+Planned architecture:
+
+```text
+Routes
+  ↓
+Middleware
+  ↓
+Controllers
+  ↓
+Services
+  ↓
+Repositories / Database
+```
+
+Background jobs are handled separately by workers.
+
+---
+
+# Initial Project Structure
+
+```text
+seatvault/
+├── backend/
+├── docs/
+│   ├── requirements.md
+│   ├── architecture.md
+│   └── database-schema.md
+├── LEARNING_LOG.md
+└── README.md
+```
+
+Backend structure currently includes:
+
+```text
+backend/
+├── src/
+│   ├── config/
+│   │   ├── db.js
+│   │   └── redis.js
+│   │
+│   ├── controllers/
+│   │   ├── health.controller.js
+│   │   ├── user.controller.js
+│   │   └── event.controller.js
+│   │
+│   ├── queues/
+│   │   └── hold.queue.js
+│   │
+│   ├── workers/
+│   │   └── hold.worker.js
+│   │
+│   ├── routes/
+│   │   ├── health.route.js
+│   │   ├── user.routes.js
+│   │   └── event.routes.js
+│   │
+│   ├── app.js
+│   ├── server.js
+│   └── test-queue.js
+│
+├── .env
+├── package.json
+└── .gitignore
+```
+
+---
+
+# Checkpoint 1 — Project Initialization
+
+## What I learned
+
+Created the SeatVault workspace and initialized the backend.
+
+Backend initialized with:
+
+```bash
+npm init -y
+```
+
+Installed:
+
+```bash
+npm install express pg dotenv
+npm install -D nodemon
+```
+
+Later installed:
+
+```bash
+npm install redis
+npm install bullmq
+npm install ioredis
+```
+
+### Important Git lesson
+
+Git commits should represent meaningful checkpoints rather than every tiny change.
+
+Initial commit:
+
+```text
+chore: initialize SeatVault project workspace
+```
+
+---
+
+# Checkpoint 2 — PostgreSQL Setup
+
+## PostgreSQL
+
+Installed PostgreSQL 16 using Homebrew.
+
+Created database:
+
+```text
+seatvault_dev
+```
+
+PostgreSQL runs locally on:
+
+```text
+localhost:5432
+```
+
+---
+
+# Database Design
+
+SeatVault uses PostgreSQL as the **source of truth** for:
+
+* Users
+* Venues
+* Events
+* Physical seats
+* Event-specific seats
+* Bookings
+* Booking seats
+* Payments
+* Tickets
+
+---
+
+# 1. Users Table
+
+```sql
+CREATE TABLE users (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT 'buyer',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Important concepts learned:
+
+* `PRIMARY KEY`
+* `UNIQUE`
+* `NOT NULL`
+* `DEFAULT`
+* `BIGSERIAL`
+
+---
+
+# 2. Venues Table
+
+```sql
+CREATE TABLE venues (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(150) NOT NULL,
+    address TEXT NOT NULL,
+    city VARCHAR(100) NOT NULL,
+    capacity INTEGER NOT NULL CHECK (capacity > 0),
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_venues_created_by
+        FOREIGN KEY (created_by)
+        REFERENCES users(id)
+);
+```
+
+Learned:
+
+* Foreign keys create relationships between tables.
+* `CHECK` constraints can enforce valid values.
+* A venue belongs to a user through `created_by`.
+
+---
+
+# 3. Events Table
+
+```sql
+CREATE TABLE events (
+    id BIGSERIAL PRIMARY KEY,
+    venue_id BIGINT NOT NULL,
+    name VARCHAR(200) NOT NULL,
+    description TEXT,
+    event_date TIMESTAMP NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft',
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_events_venue
+        FOREIGN KEY (venue_id)
+        REFERENCES venues(id),
+
+    CONSTRAINT fk_events_created_by
+        FOREIGN KEY (created_by)
+        REFERENCES users(id),
+
+    CONSTRAINT chk_events_status
+        CHECK (status IN (
+            'draft',
+            'published',
+            'cancelled',
+            'completed'
+        ))
+);
+```
+
+Learned:
+
+* An event belongs to a venue.
+* An event has a lifecycle.
+* `CHECK` constraints can restrict status values.
+
+---
+
+# 4. Seats Table
+
+```sql
+CREATE TABLE seats (
+    id BIGSERIAL PRIMARY KEY,
+    venue_id BIGINT NOT NULL,
+    section VARCHAR(50) NOT NULL,
+    row_label VARCHAR(20) NOT NULL,
+    seat_number INTEGER NOT NULL CHECK (seat_number > 0),
+    seat_type VARCHAR(20) NOT NULL DEFAULT 'regular',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_seats_venue
+        FOREIGN KEY (venue_id)
+        REFERENCES venues(id),
+
+    CONSTRAINT chk_seats_type
+        CHECK (seat_type IN (
+            'regular',
+            'premium',
+            'vip'
+        )),
+
+    CONSTRAINT unique_seat_position
+        UNIQUE (
+            venue_id,
+            section,
+            row_label,
+            seat_number
+        )
+);
+```
+
+## Important design decision
+
+`seats` represents the **physical seat in the venue**.
+
+For example:
+
+```text
+Venue 1
+Section A
+Row 1
+Seat 1
+```
+
+That physical seat can be reused for multiple events.
+
+---
+
+# 5. Event Seats Table
+
+```sql
+CREATE TABLE event_seats (
+    id BIGSERIAL PRIMARY KEY,
+    event_id BIGINT NOT NULL,
+    seat_id BIGINT NOT NULL,
+    price NUMERIC(10, 2) NOT NULL CHECK (price >= 0),
+    status VARCHAR(20) NOT NULL DEFAULT 'available',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_event_seats_event
+        FOREIGN KEY (event_id)
+        REFERENCES events(id),
+
+    CONSTRAINT fk_event_seats_seat
+        FOREIGN KEY (seat_id)
+        REFERENCES seats(id),
+
+    CONSTRAINT chk_event_seats_status
+        CHECK (
+            status IN (
+                'available',
+                'held',
+                'booked',
+                'blocked'
+            )
+        ),
+
+    CONSTRAINT unique_event_seat
+        UNIQUE (event_id, seat_id)
+);
+```
+
+## Important concept
+
+`event_seats` represents:
+
+> A physical seat for a specific event.
+
+Therefore:
+
+```text
+seats
+  ↓
+physical seat
+
+event_seats
+  ↓
+physical seat + specific event
+```
+
+This allows the same physical seat to be reused across different events.
+
+---
+
+# 6. Bookings Table
+
+```sql
+CREATE TABLE bookings (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    event_id BIGINT NOT NULL,
+    total_amount NUMERIC(10, 2) NOT NULL CHECK (total_amount >= 0),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_bookings_user
+        FOREIGN KEY (user_id)
+        REFERENCES users(id),
+
+    CONSTRAINT fk_bookings_event
+        FOREIGN KEY (event_id)
+        REFERENCES events(id),
+
+    CONSTRAINT chk_bookings_status
+        CHECK (
+            status IN (
+                'pending',
+                'confirmed',
+                'expired',
+                'cancelled',
+                'refunded'
+            )
+        )
+);
+```
+
+Booking lifecycle:
+
+```text
+pending
+   │
+   ├── payment success → confirmed
+   │
+   └── timeout → expired
+```
+
+---
+
+# 7. Booking Seats Table
+
+```sql
+CREATE TABLE booking_seats (
+    id BIGSERIAL PRIMARY KEY,
+    booking_id BIGINT NOT NULL,
+    event_seat_id BIGINT NOT NULL,
+    price_at_booking NUMERIC(10, 2) NOT NULL CHECK (price_at_booking >= 0),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_booking_seats_booking
+        FOREIGN KEY (booking_id)
+        REFERENCES bookings(id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_booking_seats_event_seat
+        FOREIGN KEY (event_seat_id)
+        REFERENCES event_seats(id),
+
+    CONSTRAINT unique_booking_event_seat
+        UNIQUE (booking_id, event_seat_id)
+);
+```
+
+Relationship:
+
+```text
+booking
+   ↓
+booking_seats
+   ↓
+event_seats
+   ↓
+seats
+```
+
+`price_at_booking` stores the price at the time of booking rather than relying on the current seat price.
+
+---
+
+# 8. Payments Table
+
+```sql
+CREATE TABLE payments (
+    id BIGSERIAL PRIMARY KEY,
+    booking_id BIGINT NOT NULL,
+    amount NUMERIC(10, 2) NOT NULL CHECK (amount >= 0),
+    payment_method VARCHAR(30),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    transaction_id VARCHAR(255) UNIQUE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_payments_booking
+        FOREIGN KEY (booking_id)
+        REFERENCES bookings(id),
+
+    CONSTRAINT chk_payments_status
+        CHECK (
+            status IN (
+                'pending',
+                'successful',
+                'failed',
+                'refunded'
+            )
+        )
+);
+```
+
+Payment processing itself has not yet been implemented.
+
+---
+
+# 9. Tickets Table
+
+```sql
+CREATE TABLE tickets (
+    id BIGSERIAL PRIMARY KEY,
+    booking_id BIGINT NOT NULL UNIQUE,
+    ticket_code VARCHAR(100) NOT NULL UNIQUE,
+    qr_code_data TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'valid',
+    issued_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_tickets_booking
+        FOREIGN KEY (booking_id)
+        REFERENCES bookings(id),
+
+    CONSTRAINT chk_tickets_status
+        CHECK (
+            status IN (
+                'valid',
+                'used',
+                'cancelled'
+            )
+        )
+);
+```
+
+Ticket processing has not yet been implemented.
+
+---
+
+# Checkpoint 3 — PostgreSQL Connection from Node.js
+
+Created:
+
+```text
+src/config/db.js
+```
+
+Using the `pg` package:
+
+```js
+const { Pool } = require("pg");
+require("dotenv").config();
+
+const pool = new Pool({
+    user: process.env.DB_USER,
+    host: process.env.DB_HOST,
+    database: process.env.DB_NAME,
+    password: process.env.DB_PASSWORD,
+    port: process.env.DB_PORT,
+});
+
+const connectDB = async () => {
+    try {
+        await pool.query("SELECT NOW()");
+        console.log("PostgreSQL connected");
+    } catch (error) {
+        console.error(
+            "PostgreSQL connection failed:",
+            error.message
+        );
+
+        process.exit(1);
+    }
+};
+
+module.exports = {
+    pool,
+    connectDB
+};
+```
+
+Learned:
+
+* `Pool` manages PostgreSQL connections.
+* `pool.query()` can execute simple queries.
+* `pool.connect()` gives a dedicated connection, which is important for transactions.
+
+---
+
+# Checkpoint 4 — Transactions
+
+## Why transactions?
+
+A transaction groups multiple database operations into one logical operation.
+
+SeatVault needs this because booking a seat involves multiple changes:
+
+```text
+Check seats
+   ↓
+Create booking
+   ↓
+Create booking_seats
+   ↓
+Mark seats held
+```
+
+These changes should not partially succeed.
+
+---
+
+# Basic Transaction
+
+```sql
+BEGIN;
+
+-- queries
+
+COMMIT;
+```
+
+If something fails:
+
+```sql
+ROLLBACK;
+```
+
+Concept:
+
+```text
+BEGIN
+  ↓
+Multiple operations
+  ↓
+Everything successful?
+  ↓ YES
+COMMIT
+
+Something failed?
+  ↓
+ROLLBACK
+```
+
+---
+
+# Node.js Transaction Pattern
+
+```js
+const client = await pool.connect();
+
+try {
+    await client.query("BEGIN");
+
+    // database operations
+
+    await client.query("COMMIT");
+} catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+} finally {
+    client.release();
+}
+```
+
+## Important lesson
+
+All queries belonging to the transaction must use:
+
+```js
+client.query()
+```
+
+and not:
+
+```js
+pool.query()
+```
+
+because the transaction belongs to one specific PostgreSQL connection.
+
+---
+
+# Checkpoint 5 — Row Locking with FOR UPDATE
+
+Learned:
+
+```sql
+SELECT ...
+FROM event_seats
+WHERE ...
+FOR UPDATE;
+```
+
+`FOR UPDATE` locks the selected rows until the transaction ends.
+
+It does **not** lock the entire table.
+
+Example:
+
+```text
+Transaction A
+     ↓
+SELECT seat 4 FOR UPDATE
+     ↓
+Seat 4 locked
+```
+
+Transaction B trying to lock the same row must wait until Transaction A:
+
+```text
+COMMIT
+```
+
+or:
+
+```text
+ROLLBACK
+```
+
+This is essential for preventing concurrent users from booking the same seat.
+
+---
+
+# Seat Locking Strategy
+
+When booking multiple seats, the requested seat IDs are sorted:
+
+```js
+const sortedSeatIds = [...seatIds].sort(
+    (a, b) => a - b
+);
+```
+
+Then seats are locked in a consistent order.
+
+This helps reduce deadlock risk when multiple transactions request overlapping seats.
+
+---
+
+# Checkpoint 6 — Booking Creation with Transaction
+
+Booking flow:
+
+```text
+POST /api/events/:eventId/bookings
+        ↓
+BEGIN
+        ↓
+Sort seat IDs
+        ↓
+SELECT event_seats
+FOR UPDATE
+        ↓
+Check seats belong to event
+        ↓
+Check seats are available
+        ↓
+Calculate total
+        ↓
+Create booking
+        ↓
+Create booking_seats
+        ↓
+Seats → held
+        ↓
+COMMIT
+```
+
+Example request:
+
+```json
+{
+    "userId": 1,
+    "seatIds": [2, 3]
+}
+```
+
+---
+
+# Seat Availability Validation
+
+The booking controller checks:
+
+### 1. All requested seats belong to the event
+
+```js
+if (result.rows.length !== sortedSeatIds.length) {
+    // reject request
+}
+```
+
+### 2. All requested seats are available
+
+```js
+const unavailableSeat = result.rows.find(
+    (seat) => seat.status !== "available"
+);
+```
+
+If one is unavailable, the transaction is rolled back.
+
+---
+
+# Why `find()`?
+
+`find()` is useful because we need the actual unavailable seat.
+
+Example:
+
+```text
+seat 2 → available
+seat 3 → held
+seat 4 → available
+```
+
+`find()` returns seat 3.
+
+This allows the API to return useful information such as:
+
+```json
+{
+    "message": "One or more seats are not available",
+    "seatId": 3,
+    "status": "held"
+}
+```
+
+---
+
+# Checkpoint 7 — JOIN Queries
+
+Learned how to combine relational tables using SQL joins.
+
+Booking information can be retrieved using:
+
+```sql
+SELECT
+    b.user_id,
+    b.event_id,
+    e.venue_id,
+    s.section,
+    s.row_label,
+    s.seat_number,
+    s.seat_type,
+    s.id AS seat_id,
+    bs.price_at_booking AS price,
+    b.status
+FROM bookings b
+JOIN booking_seats bs
+    ON b.id = bs.booking_id
+JOIN event_seats es
+    ON bs.event_seat_id = es.id
+JOIN seats s
+    ON es.seat_id = s.id
+JOIN events e
+    ON b.event_id = e.id
+ORDER BY b.id, s.id;
+```
+
+Learned that joins allow us to follow relationships:
+
+```text
+bookings
+    ↓
+booking_seats
+    ↓
+event_seats
+    ↓
+seats
+    ↓
+events
+```
+
+---
+
+# Checkpoint 8 — Redis
+
+Redis was introduced for temporary state and fast access.
+
+Installed Redis locally using Homebrew.
+
+Redis runs on:
+
+```text
+localhost:6379
+```
+
+Redis is an in-memory key-value store.
+
+Basic commands learned:
+
+```bash
+SET name Mohammad
+GET name
+DEL name
+```
+
+---
+
+# Redis TTL
+
+TTL means:
+
+> Time To Live
+
+Example:
+
+```bash
+SET message hello EX 30
+```
+
+This creates a key that expires after 30 seconds.
+
+Check remaining time:
+
+```bash
+TTL message
+```
+
+Important TTL values:
+
+```text
+positive number → remaining seconds
+-1              → key exists without expiration
+-2              → key does not exist
+```
+
+Redis automatically removes the key when its TTL expires.
+
+---
+
+# Seat Hold Keys
+
+Learned a possible Redis key structure:
+
+```text
+hold:event:1:seat:2
+```
+
+Value:
+
+```text
+booking:3
+```
+
+Example:
+
+```js
+await redisClient.set(
+    "hold:event:1:seat:2",
+    "booking:3",
+    { EX: 30 }
+);
+```
+
+For multiple seats:
+
+```js
+await redisClient.set(
+    "hold:event:1:seat:2",
+    "booking:3",
+    { EX: 30 }
+);
+
+await redisClient.set(
+    "hold:event:1:seat:3",
+    "booking:3",
+    { EX: 30 }
+);
+```
+
+---
+
+# Important Redis Architecture Lesson
+
+Redis TTL expiration does **not automatically update PostgreSQL**.
+
+For example:
+
+```text
+Redis
+hold:event:1:seat:2
+TTL expires
+       ↓
+Redis key disappears
+```
+
+This does NOT automatically mean:
+
+```text
+PostgreSQL
+event_seats.status
+held → available
+```
+
+Therefore PostgreSQL remains the source of truth.
+
+Something else must perform the database update.
+
+This led to learning BullMQ.
+
+---
+
+# Checkpoint 9 — BullMQ
+
+BullMQ is a job queue system built on Redis.
+
+Main components:
+
+```text
+Producer
+   ↓
+Queue
+   ↓
+Redis
+   ↓
+Worker
+```
+
+A job represents a unit of work that needs to happen later or asynchronously.
+
+---
+
+# Why not use setTimeout()?
+
+A simple Node.js approach could be:
+
+```js
+setTimeout(() => {
+    // release seat
+}, 600000);
+```
+
+But this is unreliable for background work.
+
+If the Node.js process crashes:
+
+```text
+setTimeout
+   ↓
+process crashes
+   ↓
+timer disappears
+```
+
+With BullMQ:
+
+```text
+Node.js
+   ↓
+BullMQ
+   ↓
+Redis
+```
+
+The job is stored outside the process.
+
+The worker can process it later.
+
+---
+
+# BullMQ Queue
+
+Created:
+
+```text
+src/queues/hold.queue.js
+```
+
+```js
+const { Queue } = require("bullmq");
+
+const holdQueue = new Queue("seat-hold", {
+    connection: {
+        host: "localhost",
+        port: 6379,
+    },
+});
+
+module.exports = holdQueue;
+```
+
+The queue name is:
+
+```text
+seat-hold
+```
+
+---
+
+# BullMQ Worker
+
+Created:
+
+```text
+src/workers/hold.worker.js
+```
+
+Worker listens to:
+
+```text
+seat-hold
+```
+
+Example:
+
+```js
+const { Worker } = require("bullmq");
+
+const holdWorker = new Worker(
+    "seat-hold",
+    async (job) => {
+        console.log("Job received:", job.name);
+        console.log("Job data:", job.data);
+    },
+    {
+        connection: {
+            host: "localhost",
+            port: 6379,
+        },
+    }
+);
+```
+
+Important concept:
+
+The producer and worker use the same queue name:
+
+```text
+Queue:
+seat-hold
+
+Worker:
+seat-hold
+```
+
+Both connect to:
+
+```text
+localhost:6379
+```
+
+Redis acts as the communication/storage layer.
+
+---
+
+# Delayed BullMQ Jobs
+
+A test job was created:
+
+```js
+await holdQueue.add(
+    "test-hold",
+    {
+        message: "Hello from SeatVault",
+    },
+    {
+        delay: 10000,
+    }
+);
+```
+
+The worker received it after the delay.
+
+Learned that delayed jobs are stored by BullMQ/Redis until they become ready.
+
+---
+
+# BullMQ Job Data Design
+
+Initially, test data contained:
+
+```js
+{
+    message: "Hello from SeatVault"
+}
+```
+
+Later changed to realistic data:
+
+```js
+{
+    bookingId: 3
+}
+```
+
+Important lesson:
+
+> Pass an identifier through the queue and query the current database state when the worker executes.
+
+Avoid passing stale booking status such as:
+
+```js
+{
+    bookingId: 3,
+    status: "pending"
+}
+```
+
+because the booking might become confirmed before the job runs.
+
+Better:
+
+```js
+{
+    bookingId: 3
+}
+```
+
+Then the worker queries PostgreSQL.
+
+---
+
+# Checkpoint 10 — BullMQ Worker + PostgreSQL
+
+The worker was connected to PostgreSQL:
+
+```js
+const { pool } = require("../config/db");
+```
+
+The worker receives:
+
+```js
+const { bookingId } = job.data;
+```
+
+Then queries:
+
+```sql
+SELECT id, user_id, event_id, total_amount, status
+FROM bookings
+WHERE id = $1;
+```
+
+This established the architecture:
+
+```text
+BullMQ
+   ↓
+bookingId
+   ↓
+Worker
+   ↓
+PostgreSQL
+   ↓
+Current booking state
+```
+
+---
+
+# Checkpoint 11 — Booking Hold Expiration
+
+The worker was extended to automatically expire pending bookings.
+
+The worker starts a transaction:
+
+```js
+await client.query("BEGIN");
+```
+
+Then locks the booking:
+
+```sql
+SELECT id, user_id, event_id, total_amount, status
+FROM bookings
+WHERE id = $1
+FOR UPDATE;
+```
+
+---
+
+# Worker Checks Booking Status
+
+The worker checks:
+
+```js
+if (booking.status !== "pending") {
+    await client.query("COMMIT");
+    return;
+}
+```
+
+This prevents already-confirmed or otherwise processed bookings from being expired.
+
+Example:
+
+```text
+Booking = confirmed
+        ↓
+Expiration job runs
+        ↓
+Worker checks PostgreSQL
+        ↓
+status !== pending
+        ↓
+Do nothing
+```
+
+---
+
+# Expiring the Booking
+
+If the booking is still pending:
+
+```sql
+UPDATE bookings
+SET status = 'expired',
+    updated_at = CURRENT_TIMESTAMP
+WHERE id = $1;
+```
+
+---
+
+# Releasing the Seats
+
+Seats belonging to the booking are changed:
+
+```sql
+UPDATE event_seats
+SET status = 'available',
+    updated_at = CURRENT_TIMESTAMP
+WHERE id IN (
+    SELECT event_seat_id
+    FROM booking_seats
+    WHERE booking_id = $1
+)
+AND status = 'held';
+```
+
+This was also understood using PostgreSQL `UPDATE ... FROM` syntax:
+
+```sql
+UPDATE event_seats AS es
+SET status = 'available',
+    updated_at = CURRENT_TIMESTAMP
+FROM booking_seats AS bs
+WHERE es.id = bs.event_seat_id
+  AND bs.booking_id = $1
+  AND es.status = 'held';
+```
+
+---
+
+# Why the Worker Uses a Transaction
+
+The expiration operation consists of two related changes:
+
+```text
+Booking → expired
+Seats → available
+```
+
+These should happen together.
+
+Without a transaction:
+
+```text
+UPDATE booking
+    ↓
+success
+
+UPDATE seats
+    ↓
+failure
+```
+
+The database could become:
+
+```text
+Booking = expired
+Seats = held
+```
+
+This is inconsistent.
+
+With a transaction:
+
+```text
+BEGIN
+   ↓
+Booking → expired
+   ↓
+Seats → available
+   ↓
+COMMIT
+```
+
+If anything fails:
+
+```text
+BEGIN
+   ↓
+Booking → expired
+   ↓
+Seat update fails
+   ↓
+ROLLBACK
+```
+
+The booking change is undone.
+
+Therefore:
+
+```text
+COMMIT
+    =
+make all changes permanent
+
+ROLLBACK
+    =
+undo all changes in this transaction
+```
+
+---
+
+# Why FOR UPDATE Is Important in the Worker
+
+The worker uses:
+
+```sql
+FOR UPDATE
+```
+
+because later the payment/confirmation flow will also need to modify the booking.
+
+Possible race:
+
+```text
+             Booking 5
+                │
+       ┌────────┴────────┐
+       ↓                 ↓
+Payment request    Expiration worker
+```
+
+Both could try to modify the booking.
+
+`FOR UPDATE` ensures only one transaction can hold the booking row lock at a time.
+
+The lock lasts until:
+
+```text
+COMMIT
+```
+
+or:
+
+```text
+ROLLBACK
+```
+
+---
+
+# Checkpoint 12 — `expires_at`
+
+The `bookings` table already contained:
+
+```sql
+expires_at TIMESTAMP
+```
+
+Initially it was:
+
+```text
+NULL
+```
+
+The booking creation logic was updated so a new pending booking gets a 10-minute expiration time.
+
+The SQL uses:
+
+```sql
+CURRENT_TIMESTAMP + INTERVAL '10 minutes'
+```
+
+Example:
+
+```text
+Booking created:
+09:30:00
+
+expires_at:
+09:40:00
+```
+
+---
+
+# Why `expires_at` Is Needed
+
+Previously the BullMQ test used:
+
+```js
+delay: 10000
+```
+
+This was only a 10-second test.
+
+Now the database knows:
+
+```text
+"When does this booking expire?"
+```
+
+This is useful business data.
+
+Example:
+
+```text
+booking 5
+status = pending
+expires_at = 09:40:00
+```
+
+---
+
+# Calculating BullMQ Delay
+
+BullMQ's `delay` is specified in milliseconds.
+
+Therefore:
+
+```js
+const delayMs =
+    new Date(booking.expires_at).getTime()
+    - Date.now();
+```
+
+This means:
+
+```text
+expiration timestamp
+        -
+current timestamp
+        =
+milliseconds until expiration
+```
+
+For 10 minutes:
+
+```text
+10 × 60 × 1000
+=
+600000 ms
+```
+
+A real test produced:
+
+```text
+BullMQ delay: 599967
+```
+
+The difference from `600000` was only 33 milliseconds because a small amount of time passed while the code executed.
+
+---
+
+# Checkpoint 13 — Connecting Booking Creation to BullMQ
+
+Previously, BullMQ was tested manually using:
+
+```text
+test-queue.js
+```
+
+The actual booking system was then connected directly to the queue.
+
+At the top of the booking controller:
+
+```js
+const holdQueue = require("../queues/hold.queue");
+```
+
+After the PostgreSQL transaction commits:
+
+```js
+await client.query("COMMIT");
+```
+
+the controller calculates:
+
+```js
+const delayMs =
+    new Date(booking.expires_at).getTime()
+    - Date.now();
+```
+
+Then creates the delayed job:
+
+```js
+await holdQueue.add(
+    "release-hold",
+    {
+        bookingId: booking.id,
+    },
+    {
+        delay: delayMs,
+    }
+);
+```
+
+---
+
+# Why the BullMQ Job Is Added After COMMIT
+
+The flow is intentionally:
+
+```text
+BEGIN
+   ↓
+Create booking
+   ↓
+Create booking seats
+   ↓
+Hold seats
+   ↓
+COMMIT
+   ↓
+Add BullMQ job
+```
+
+We don't want:
+
+```text
+BEGIN
+   ↓
+Create booking
+   ↓
+Add BullMQ job
+   ↓
+Database transaction fails
+   ↓
+ROLLBACK
+```
+
+because that could leave a BullMQ job referring to a booking that never successfully committed.
+
+Therefore the current learning implementation adds the job after the PostgreSQL transaction commits.
+
+---
+
+# How BullMQ and PostgreSQL Are Connected
+
+BullMQ is not directly connected to PostgreSQL.
+
+The Node.js application is the bridge.
+
+Architecture:
+
+```text
+                 Node.js
+              /           \
+             ↓             ↓
+       PostgreSQL        BullMQ
+                            ↓
+                          Redis
+                            ↓
+                          Worker
+                            ↓
+                       PostgreSQL
+```
+
+The producer:
+
+```js
+holdQueue.add(...)
+```
+
+puts a job into the:
+
+```text
+seat-hold
+```
+
+queue.
+
+The worker:
+
+```js
+new Worker("seat-hold", ...)
+```
+
+listens to that same queue.
+
+Redis is the shared infrastructure that stores and coordinates the jobs.
+
+---
+
+# Complete Automatic Hold Expiration Flow
+
+The complete flow is now:
+
+```text
+User
+  ↓
+POST /api/events/:eventId/bookings
+  ↓
+createBooking()
+  ↓
+BEGIN
+  ↓
+Lock requested event seats
+  ↓
+Check availability
+  ↓
+Create booking
+  ↓
+expires_at = current time + 10 minutes
+  ↓
+Create booking_seats
+  ↓
+Seats → held
+  ↓
+COMMIT
+  ↓
+Calculate BullMQ delay
+  ↓
+Add release-hold job
+  ↓
+Redis / BullMQ
+  ↓
+Wait until expiration
+  ↓
+Worker receives bookingId
+  ↓
+BEGIN
+  ↓
+SELECT booking FOR UPDATE
+  ↓
+Check current status
+  ↓
+If pending
+  ↓
+Booking → expired
+  ↓
+Seats → available
+  ↓
+COMMIT
+```
+
+---
+
+# Test That Proved the Integration Works
+
+A new booking was created using available seats.
+
+Example booking:
+
+```text
+Booking ID: 7
+User ID: 1
+Event ID: 1
+Total: 998
+Status: pending
+```
+
+The BullMQ job was automatically created from the booking controller.
+
+After the delay, the worker printed:
+
+```text
+Job received: release-hold
+Job data: { bookingId: '7' }
+
+Booking found: {
+  id: '7',
+  user_id: '1',
+  event_id: '1',
+  total_amount: '998.00',
+  status: 'pending'
+}
+
+Booking 7 expired
+Seats for booking 7 released
+Job completed: 12
+```
+
+This proved that the complete automatic flow works.
+
+---
+
+# Important Concept — HELD vs BOOKED
+
+A seat being `held` does NOT mean the user permanently owns it.
+
+Current intended lifecycle:
+
+```text
+AVAILABLE
+    ↓
+User selects seat
+    ↓
+HELD
+    │
+    ├── Payment/confirmation succeeds
+    │        ↓
+    │      BOOKED
+    │
+    └── Time expires
+             ↓
+          AVAILABLE
+```
+
+Booking lifecycle:
+
+```text
+PENDING
+   │
+   ├── payment success → CONFIRMED
+   │
+   └── timeout → EXPIRED
+```
+
+The actual payment/confirmation flow has not yet been implemented.
+
+---
+
+# Important Concept — What Happens to the BullMQ Job After Payment?
+
+Suppose:
+
+```text
+Booking = pending
+Seats = held
+```
+
+The user completes payment before the 10-minute expiration.
+
+The booking should become:
+
+```text
+confirmed
+```
+
+The seats should become:
+
+```text
+booked
+```
+
+The BullMQ expiration job may still run later.
+
+When it runs, the worker checks PostgreSQL:
+
+```text
+status = confirmed
+```
+
+Therefore:
+
+```text
+status !== pending
+```
+
+and the worker does nothing.
+
+This is why the worker checks the current database state rather than blindly expiring the booking.
+
+---
+
+# Current Seat Lifecycle
+
+```text
+┌───────────┐
+│ AVAILABLE │
+└─────┬─────┘
+      │
+      │ booking created
+      ↓
+┌───────────┐
+│   HELD    │
+└─────┬─────┘
+      │
+      ├───────────────┐
+      │               │
+      │ payment       │ timeout
+      │ successful    │
+      ↓               ↓
+┌───────────┐    ┌───────────┐
+│  BOOKED   │    │ AVAILABLE │
+└───────────┘    └───────────┘
+```
+
+---
+
+# Current Booking Lifecycle
+
+```text
+┌─────────┐
+│ PENDING │
+└────┬────┘
+     │
+     ├───────────────┐
+     │               │
+     │ payment       │ timeout
+     │ success       │
+     ↓               ↓
+┌───────────┐   ┌─────────┐
+│ CONFIRMED │   │ EXPIRED │
+└───────────┘   └─────────┘
+```
+
+---
+
+# Major Concepts Learned So Far
+
+## PostgreSQL
+
+* Relational database design
+* Primary keys
+* Foreign keys
+* Unique constraints
+* Check constraints
+* One-to-many relationships
+* Event-specific seat inventory
+* SQL joins
+* `UPDATE ... FROM`
+* Transactions
+* `BEGIN`
+* `COMMIT`
+* `ROLLBACK`
+* `SELECT ... FOR UPDATE`
+* Row-level locking
+* Consistent lock ordering
+* PostgreSQL as source of truth
+
+## Redis
+
+* Key-value storage
+* Redis commands
+* TTL
+* Automatic key expiration
+* Redis as infrastructure for BullMQ
+* Why Redis expiration does not automatically modify PostgreSQL
+
+## BullMQ
+
+* Jobs
+* Queues
+* Producers
+* Workers
+* Redis-backed job storage
+* Delayed jobs
+* Queue names
+* Worker listening
+* Passing identifiers through jobs
+* Querying fresh database state inside workers
+
+## Backend Concurrency
+
+* Preventing double booking
+* Row-level locking
+* Transactional consistency
+* Race conditions
+* Payment vs expiration race
+* Atomic operations
+* Avoiding partial database updates
+
+---
+
+# Current Implementation Status
+
+## Completed
+
+* PostgreSQL database setup
+* Relational database schema
+* Users
+* Venues
+* Events
+* Physical seats
+* Event-specific seats
+* Bookings
+* Booking seats
+* Payments table
+* Tickets table
+* PostgreSQL connection from Node.js
+* Booking creation
+* Seat availability checking
+* Transactional booking
+* Row-level seat locking
+* Redis setup
+* Redis Node.js integration
+* Redis TTL experiments
+* BullMQ setup
+* BullMQ worker
+* Delayed jobs
+* PostgreSQL integration inside worker
+* Booking expiration worker
+* Seat release after expiration
+* `expires_at`
+* Dynamic BullMQ delay
+* Automatic BullMQ job creation from booking creation
+* End-to-end automatic hold expiration
+
+---
+
+# Not Implemented Yet
+
+* Actual payment integration
+* Payment confirmation flow
+* Booking confirmation
+* Changing event seats from `held` → `booked`
+* Payment webhooks
+* Payment idempotency
+* Ticket generation
+* QR code generation
+* Authentication/authorization for the final booking flow
+* Redis production hold strategy
+* Docker Compose
+* Load/concurrency testing
+* Deployment
+* Observability/logging improvements
+
+---
+
+# Current Important Architecture
+
+```text
+                    SeatVault
+                       │
+                       ↓
+                Express Backend
+                       │
+          ┌────────────┴────────────┐
+          ↓                         ↓
+     PostgreSQL                  BullMQ
+          │                         │
+ Source of truth                  Redis
+          │                         │
+          │                      Worker
+          │                         │
+          └────────────┬────────────┘
+                       ↓
+                  PostgreSQL
+```
+
+PostgreSQL remains the source of truth for:
+
+* Booking status
+* Seat status
+* Prices
+* Relationships
+* Expiration timestamp
+
+Redis/BullMQ handles:
+
+* Delayed background work
+* Scheduling booking expiration
+* Worker execution
+
+---
+
+# Latest Git Checkpoint
+
+Suggested commit:
+
+```bash
+git add .
+git commit -m "feat: connect booking holds with BullMQ expiration"
+```
+
+This checkpoint represents the successful end-to-end implementation of:
+
+```text
+Booking
+   ↓
+Seat hold
+   ↓
+expires_at
+   ↓
+BullMQ delayed job
+   ↓
+Worker
+   ↓
+Booking expiration
+   ↓
+Seat release
+```
+
+---
+
+# Next Learning Goal
+
+The next major feature is the **booking confirmation/payment flow**.
+
+The intended flow is:
+
+```text
+HELD
+  ↓
+User completes payment
+  ↓
+Payment succeeds
+  ↓
+Booking → CONFIRMED
+  ↓
+Seats → BOOKED
+```
+
+The important concurrency case to study will be:
+
+```text
+Payment confirmation
+        vs
+Expiration worker
+```
+
+Both may attempt to modify the same booking near the expiration time.
+
+This will build on the concepts already learned:
+
+* Transactions
+* `FOR UPDATE`
+* Current database state
+* Atomic updates
+* Race conditions
+* BullMQ delayed jobs
+
+```
+
+### Current checkpoint
+
+At this point, the **temporary hold → automatic expiration → seat release** system is fully working end-to-end.
+
+The next major concept is **confirming a held booking before its expiration**, which will complete the other branch of the booking lifecycle.
+```
+
 ```
