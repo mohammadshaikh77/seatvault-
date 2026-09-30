@@ -9243,3 +9243,1955 @@ The next major concept is **confirming a held booking before its expiration**, w
 ```
 
 ```
+Absolutely. Before moving to tickets, this is a good checkpoint to commit because we've completed a **major backend milestone: booking → hold → expiration → payment → confirmation → idempotent webhook**.
+
+Below is the updated `LEARNING_LOG.md`, continuing from the previous checkpoint.
+
+# `LEARNING_LOG.md`
+
+````md
+# SeatVault — Learning Log
+
+This document tracks the backend concepts, implementation decisions, debugging lessons,
+database experiments, and important things learned while building SeatVault.
+
+The goal is not only to build the project, but to understand why each backend component
+exists and how the pieces work together.
+
+---
+
+# Project Overview
+
+## Project
+
+SeatVault — Event Ticket Booking Platform
+
+## Goal
+
+Build a backend system for event ticket booking that correctly handles:
+
+- Event management
+- Venue and physical seats
+- Event-specific seat inventory
+- Temporary seat holds
+- Concurrent booking attempts
+- Booking expiration
+- Payment processing
+- Payment webhooks
+- Idempotent payment processing
+- Ticket generation
+- Background jobs
+
+The main backend problem being explored is:
+
+> How do we prevent two users from successfully booking the same seat
+> when multiple requests happen at the same time?
+
+---
+
+# Tech Stack
+
+- Node.js
+- Express.js
+- PostgreSQL
+- Redis
+- BullMQ
+- JWT
+- Docker
+- Postman
+- k6 / Artillery
+- Git / GitHub
+
+---
+
+# Architecture
+
+SeatVault uses a modular monolithic architecture.
+
+```text
+Client
+   |
+   v
+Express API
+   |
+   +--> Routes
+   |
+   +--> Middleware
+   |
+   +--> Controllers
+   |
+   +--> Services
+   |
+   +--> PostgreSQL
+   |
+   +--> Redis
+   |
+   +--> BullMQ
+   |
+   +--> External Payment Provider
+````
+
+Typical request flow:
+
+```text
+Client Request
+      |
+      v
+Route
+      |
+      v
+Middleware
+      |
+      v
+Controller
+      |
+      v
+Service
+      |
+      +------> PostgreSQL
+      |
+      +------> Redis
+      |
+      +------> External Service
+```
+
+---
+
+# Database Design
+
+## Main Tables
+
+```text
+users
+venues
+seats
+events
+event_seats
+bookings
+booking_seats
+payments
+tickets
+```
+
+---
+
+# Important Database Relationships
+
+## Physical seats vs event seats
+
+A physical seat belongs to a venue:
+
+```text
+seats
+```
+
+Example:
+
+```text
+Venue A
+  |
+  +-- Seat A1
+  +-- Seat A2
+  +-- Seat A3
+```
+
+The same physical seat can be reused for different events.
+
+Therefore:
+
+```text
+seats
+   |
+   v
+event_seats
+```
+
+`event_seats` represents the availability of a physical seat for a particular event.
+
+Example:
+
+```text
+Event 1 + Seat 1 = event_seat
+Event 2 + Seat 1 = another event_seat
+```
+
+This allows the same physical venue seat to be reused across different events.
+
+---
+
+# `booking_seats`
+
+A booking can contain multiple seats.
+
+Therefore:
+
+```text
+bookings
+    |
+    v
+booking_seats
+    |
+    v
+event_seats
+```
+
+Example:
+
+```text
+Booking 8
+   |
+   +---- Seat 2
+   |
+   +---- Seat 3
+```
+
+The `bookings` table tells us about the reservation itself.
+
+The `booking_seats` table tells us which seats belong to that reservation.
+
+The `event_seats` table contains the actual seat inventory and its current state.
+
+---
+
+# Booking Lifecycle
+
+The intended booking lifecycle is:
+
+```text
+pending
+   |
+   +----> confirmed
+   |
+   +----> expired
+   |
+   +----> cancelled
+   |
+   +----> refunded
+```
+
+For seat inventory:
+
+```text
+available
+    |
+    v
+  held
+    |
+    +----> booked
+    |
+    +----> available
+```
+
+---
+
+# PostgreSQL Transactions
+
+One of the most important concepts learned.
+
+A booking operation may require multiple database changes.
+
+For example:
+
+```text
+Create booking
+Create booking_seats
+Update event_seats
+```
+
+If one operation succeeds and another fails, the database can become inconsistent.
+
+Example without a transaction:
+
+```text
+Booking created
+      |
+      v
+Booking seats created
+      |
+      v
+Seat update fails
+```
+
+Now we could have:
+
+```text
+booking exists
+booking_seats exists
+seat still available
+```
+
+This is incorrect.
+
+---
+
+# BEGIN / COMMIT / ROLLBACK
+
+The solution is a PostgreSQL transaction:
+
+```sql
+BEGIN;
+
+-- database operations
+
+COMMIT;
+```
+
+If something fails:
+
+```sql
+ROLLBACK;
+```
+
+Mental model:
+
+```text
+BEGIN
+  |
+  +--> operation 1
+  |
+  +--> operation 2
+  |
+  +--> operation 3
+  |
+  +--> COMMIT
+```
+
+If operation 2 or 3 fails:
+
+```text
+ROLLBACK
+```
+
+and the transaction is undone.
+
+---
+
+# PostgreSQL Row Locking — FOR UPDATE
+
+Another major concept learned.
+
+Example:
+
+```sql
+SELECT id, user_id, event_id, total_amount, status, expires_at
+FROM bookings
+WHERE id = $1
+FOR UPDATE;
+```
+
+`FOR UPDATE` locks the selected row inside the current transaction.
+
+This matters when two processes try to modify the same booking.
+
+Example:
+
+```text
+Payment confirmation
+        |
+        | lock booking
+        v
+     Booking 10
+        ^
+        | lock booking
+        |
+Expiration worker
+```
+
+Only one transaction gets the row lock first.
+
+The other transaction waits.
+
+This prevents conflicting state transitions.
+
+---
+
+# Why FOR UPDATE matters in SeatVault
+
+Important race condition:
+
+```text
+Payment confirmation
+        VS
+Hold expiration
+```
+
+Possible outcomes:
+
+### Payment gets the lock first
+
+```text
+pending
+   |
+   v
+confirmed
+```
+
+Expiration worker later sees:
+
+```text
+confirmed
+```
+
+and does nothing.
+
+### Expiration gets the lock first
+
+```text
+pending
+   |
+   v
+expired
+```
+
+Payment processing later sees:
+
+```text
+expired
+```
+
+and rejects the confirmation.
+
+Therefore an expired booking cannot be resurrected by a late payment.
+
+---
+
+# Booking Creation
+
+Implemented booking creation using:
+
+```text
+POST /api/events/:eventId/bookings
+```
+
+Example:
+
+```text
+POST /api/events/1/bookings
+```
+
+Body:
+
+```json
+{
+    "userId": 1,
+    "seatIds": [2, 3]
+}
+```
+
+The controller:
+
+1. Starts a transaction.
+2. Sorts seat IDs.
+3. Finds the requested event seats.
+4. Locks them using `FOR UPDATE`.
+5. Checks that all requested seats belong to the event.
+6. Checks that all seats are available.
+7. Calculates the total amount.
+8. Creates the booking.
+9. Creates `booking_seats`.
+10. Changes the event seats from `available` to `held`.
+11. Commits the transaction.
+12. Creates a BullMQ expiration job.
+
+---
+
+# Why Sort Seat IDs?
+
+Before locking seats:
+
+```js
+const sortedSeatIds = [...seatIds].sort((a, b) => a - b);
+```
+
+This creates a consistent locking order.
+
+For example:
+
+```text
+Request A:
+Seat 2 → Seat 3
+
+Request B:
+Seat 3 → Seat 2
+```
+
+Without consistent ordering, concurrent transactions can lock resources in different orders.
+
+Sorting creates:
+
+```text
+Seat 2 → Seat 3
+```
+
+for both requests.
+
+This helps reduce deadlock risk.
+
+---
+
+# Temporary Seat Holds
+
+When a user creates a booking, seats are not immediately permanently booked.
+
+Instead:
+
+```text
+available
+    |
+    v
+held
+```
+
+Example:
+
+```text
+Seat 2 → held
+Seat 3 → held
+```
+
+The booking receives an expiration time:
+
+```text
+current time + 10 minutes
+```
+
+The booking table contains:
+
+```text
+expires_at
+```
+
+Example:
+
+```text
+expires_at = CURRENT_TIMESTAMP + INTERVAL '10 minutes'
+```
+
+---
+
+# Why HOLD exists
+
+A user needs time to complete payment.
+
+Without a temporary hold:
+
+```text
+User A selects Seat 2
+User A goes to payment
+
+User B selects Seat 2
+```
+
+User B could potentially take the seat while User A is paying.
+
+Therefore:
+
+```text
+available
+   |
+   v
+held
+   |
+   +----> booked
+   |
+   +----> available
+```
+
+---
+
+# Redis
+
+Redis was introduced for temporary data and background-job infrastructure.
+
+Redis was tested with:
+
+```text
+PING
+SET
+GET
+TTL
+```
+
+Example concept:
+
+```text
+seat:1:event:1
+```
+
+can represent temporary hold information.
+
+Redis is not the source of truth for permanent seat ownership.
+
+PostgreSQL remains the source of truth.
+
+---
+
+# BullMQ
+
+BullMQ is used for background jobs.
+
+Queue:
+
+```text
+seat-hold
+```
+
+Producer:
+
+```js
+await holdQueue.add(
+    "release-hold",
+    {
+        bookingId: booking.id,
+    },
+    {
+        delay: delayMs,
+    }
+);
+```
+
+Worker:
+
+```js
+const holdWorker = new Worker(
+    "seat-hold",
+    async (job) => {
+        // process expiration
+    }
+);
+```
+
+---
+
+# How Producer and Worker Communicate
+
+The controller does not directly call the worker.
+
+Instead:
+
+```text
+Controller
+    |
+    v
+BullMQ Queue
+    |
+    v
+Redis
+    |
+    v
+Worker
+```
+
+The producer creates a job:
+
+```text
+bookingId = 9
+```
+
+Redis stores the delayed job.
+
+When its delay expires, BullMQ makes the job available.
+
+The worker is listening to the same queue:
+
+```text
+seat-hold
+```
+
+and receives the job.
+
+The worker therefore does not need to be manually told:
+
+> "Process booking 9."
+
+It is automatically notified through the queue.
+
+---
+
+# Delayed Job
+
+Booking expiration time is stored in PostgreSQL.
+
+Example:
+
+```text
+expires_at = 10 minutes from now
+```
+
+The delay is calculated dynamically:
+
+```js
+const delayMs =
+    new Date(booking.expires_at).getTime() - Date.now();
+```
+
+Then:
+
+```js
+await holdQueue.add(
+    "release-hold",
+    {
+        bookingId: booking.id,
+    },
+    {
+        delay: delayMs,
+    }
+);
+```
+
+This connects PostgreSQL's expiration time with BullMQ's delayed execution.
+
+---
+
+# Booking Expiration Worker
+
+Worker flow:
+
+```text
+Receive bookingId
+      |
+      v
+BEGIN
+      |
+      v
+SELECT booking FOR UPDATE
+      |
+      v
+Booking exists?
+      |
+      v
+Is status pending?
+      |
+      +---- NO ---> COMMIT / do nothing
+      |
+      +---- YES
+              |
+              v
+       booking → expired
+              |
+              v
+       seats → available
+              |
+              v
+            COMMIT
+```
+
+The worker updates:
+
+```text
+pending → expired
+```
+
+and:
+
+```text
+held → available
+```
+
+for seats belonging to that booking.
+
+---
+
+# UPDATE ... FROM
+
+Learned PostgreSQL's `UPDATE ... FROM` syntax.
+
+Example:
+
+```sql
+UPDATE event_seats AS es
+SET status = 'available',
+    updated_at = CURRENT_TIMESTAMP
+FROM booking_seats AS bs
+WHERE es.id = bs.event_seat_id
+  AND bs.booking_id = $1
+  AND es.status = 'held';
+```
+
+Meaning:
+
+```text
+booking_seats
+      |
+      | event_seat_id
+      v
+event_seats
+      |
+      v
+change status
+```
+
+The important condition is:
+
+```sql
+bs.booking_id = $1
+```
+
+This ensures only seats belonging to that particular booking are modified.
+
+---
+
+# Important Test — Automatic Expiration
+
+Booking 7 was used to test the complete automatic expiration path.
+
+Flow:
+
+```text
+Postman
+   |
+   v
+Create booking
+   |
+   v
+PostgreSQL
+   |
+   v
+BullMQ delayed job
+   |
+   v
+Redis
+   |
+   v
+Worker
+   |
+   v
+PostgreSQL
+   |
+   +--> booking expired
+   |
+   +--> seats released
+```
+
+Worker output confirmed:
+
+```text
+Job received: release-hold
+Booking found
+Booking 7 expired
+Seats for booking 7 released
+Job completed
+```
+
+This proved the complete asynchronous expiration flow.
+
+---
+
+# Important Debugging Lesson — Stale Pending Booking
+
+During testing, booking 4 was found in this state:
+
+```text
+status = pending
+expires_at = already in the past
+```
+
+but its seats were still:
+
+```text
+held
+```
+
+This happened because the expiration worker had not released those seats.
+
+This demonstrated an important real-world lesson:
+
+> Background jobs can fail, stop, or be delayed.
+
+Therefore PostgreSQL remains the source of truth.
+
+The API also checks:
+
+```js
+booking.expires_at <= new Date()
+```
+
+before allowing payment/confirmation.
+
+The stale booking was manually cleaned up using a PostgreSQL transaction.
+
+---
+
+# Manual Booking Confirmation
+
+Initially a manual confirmation endpoint was implemented:
+
+```text
+POST /api/events/:eventId/bookings/:bookingId/confirm
+```
+
+Flow:
+
+```text
+Lock booking
+    |
+    v
+Check booking exists
+    |
+    v
+Check event ownership
+    |
+    v
+Check status = pending
+    |
+    v
+Check expiration
+    |
+    v
+booking → confirmed
+    |
+    v
+seats → booked
+    |
+    v
+COMMIT
+```
+
+This was used as a learning step to understand:
+
+```text
+HELD → BOOKED
+PENDING → CONFIRMED
+```
+
+Later, proper payment processing was introduced.
+
+Therefore this endpoint is now considered a temporary/test confirmation mechanism and should eventually be removed or refactored so clients cannot bypass payment.
+
+---
+
+# Important JavaScript / PostgreSQL Type Issue
+
+During confirmation we encountered:
+
+```text
+Booking does not belong to this event
+```
+
+even though PostgreSQL clearly showed:
+
+```text
+event_id = 1
+```
+
+The problem was PostgreSQL `BIGINT` values being returned by `pg` as strings.
+
+The comparison was effectively:
+
+```js
+"1" !== 1
+```
+
+which evaluates to:
+
+```text
+true
+```
+
+The fix was:
+
+```js
+if (Number(booking.event_id) !== Number(eventId)) {
+```
+
+Lesson:
+
+> Be careful when comparing PostgreSQL BIGINT values with JavaScript numbers.
+
+---
+
+# Payment System
+
+After booking and expiration were working, payment processing was introduced.
+
+The `payments` table contains:
+
+```text
+id
+booking_id
+amount
+payment_method
+status
+transaction_id
+created_at
+updated_at
+```
+
+Payment status:
+
+```text
+pending
+successful
+failed
+refunded
+```
+
+Important constraint:
+
+```sql
+transaction_id VARCHAR(255) UNIQUE
+```
+
+---
+
+# Payment Initiation
+
+Endpoint:
+
+```text
+POST /api/bookings/:bookingId/payment
+```
+
+Example:
+
+```text
+POST /api/bookings/11/payment
+```
+
+Flow:
+
+```text
+Find booking
+     |
+     v
+FOR UPDATE
+     |
+     v
+Booking exists?
+     |
+     v
+status = pending?
+     |
+     v
+not expired?
+     |
+     v
+generate transaction ID
+     |
+     v
+create payment
+     |
+     v
+payment = pending
+     |
+     v
+COMMIT
+```
+
+A simulated transaction ID is generated:
+
+```js
+const transactionId = `txn_${Date.now()}`;
+```
+
+Example:
+
+```text
+txn_1790771066812
+```
+
+The simulated payment provider is used for learning instead of integrating a real payment gateway at this stage.
+
+---
+
+# Payment Initiation State
+
+Example:
+
+```text
+Booking 11
+status = pending
+
+Payment 2
+status = pending
+transaction_id = txn_1790771066812
+```
+
+Important distinction:
+
+> Creating a payment does NOT mean the payment succeeded.
+
+The payment remains:
+
+```text
+pending
+```
+
+until the payment provider reports the result.
+
+---
+
+# Payment Webhook
+
+Webhook endpoint:
+
+```text
+POST /api/bookings/webhook
+```
+
+Example request:
+
+```json
+{
+    "transactionId": "txn_1790771066812",
+    "status": "successful"
+}
+```
+
+The webhook represents the payment provider's result.
+
+The `createPayment` endpoint creates:
+
+```text
+payment = pending
+```
+
+The webhook can report:
+
+```text
+successful
+```
+
+or:
+
+```text
+failed
+```
+
+---
+
+# Webhook Validation
+
+Only these webhook statuses are accepted:
+
+```js
+if (!["successful", "failed"].includes(status)) {
+    return res.status(400).json({
+        message: "Invalid payment status",
+    });
+}
+```
+
+This prevents arbitrary status values from entering the payment state machine.
+
+---
+
+# Payment Failure
+
+If the provider sends:
+
+```json
+{
+    "transactionId": "txn_...",
+    "status": "failed"
+}
+```
+
+the payment becomes:
+
+```text
+pending → failed
+```
+
+The booking remains pending.
+
+Why?
+
+Because a failed payment does not confirm the booking.
+
+The booking can eventually expire and release its seats.
+
+---
+
+# Successful Payment Webhook
+
+Successful payment flow:
+
+```text
+Webhook
+   |
+   v
+Find payment using transaction_id
+   |
+   v
+Lock payment
+   |
+   v
+Already successful?
+   |
+   +---- YES → return safely
+   |
+   +---- NO
+           |
+           v
+      Find booking
+           |
+           v
+      Lock booking
+           |
+           v
+      booking pending?
+           |
+           v
+      booking not expired?
+           |
+           v
+      payment → successful
+           |
+           v
+      booking → confirmed
+           |
+           v
+      seats → booked
+           |
+           v
+         COMMIT
+```
+
+All three state changes happen in the same PostgreSQL transaction.
+
+---
+
+# Payment + Booking + Seat Atomicity
+
+Successful payment performs:
+
+```text
+payment:
+pending → successful
+
+booking:
+pending → confirmed
+
+seats:
+held → booked
+```
+
+These changes happen inside:
+
+```text
+BEGIN
+...
+COMMIT
+```
+
+If the seat update fails after the payment and booking updates, the transaction is rolled back.
+
+Therefore we don't end up with:
+
+```text
+payment = successful
+booking = confirmed
+seats = held
+```
+
+The entire operation succeeds or fails together.
+
+---
+
+# Idempotency
+
+One of the most important new backend concepts.
+
+## Definition
+
+Idempotency means:
+
+> Repeating the same logical operation multiple times should not create additional side effects.
+
+Payment systems need this because webhooks can be retried.
+
+Example:
+
+```text
+Payment provider
+      |
+      +---- SUCCESS webhook
+      |
+      +---- SUCCESS webhook again
+      |
+      +---- SUCCESS webhook again
+```
+
+The same payment event can arrive multiple times.
+
+---
+
+# Why Duplicate Webhooks Are Dangerous
+
+Without idempotency:
+
+```text
+Webhook #1
+    |
+    +--> payment successful
+    +--> booking confirmed
+    +--> seats booked
+    +--> ticket created
+
+Webhook #2
+    |
+    +--> payment successful again
+    +--> booking confirmed again
+    +--> seats booked again
+    +--> duplicate ticket
+```
+
+This can create duplicate side effects.
+
+---
+
+# Two Layers of Idempotency
+
+## 1. Database constraint
+
+The `payments` table contains:
+
+```sql
+transaction_id VARCHAR(255) UNIQUE
+```
+
+Therefore:
+
+```text
+same transaction_id
+       ↓
+cannot create multiple payment records
+```
+
+PostgreSQL protects the data.
+
+---
+
+## 2. Application-level idempotency
+
+The webhook checks:
+
+```js
+if (payment.status === "successful") {
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+        message: "Payment already processed",
+    });
+}
+```
+
+Therefore if the same webhook arrives again:
+
+```text
+Find payment
+    |
+    v
+status = successful
+    |
+    v
+STOP
+```
+
+No downstream side effects are repeated.
+
+---
+
+# Idempotency vs Transactions
+
+These concepts are different.
+
+## Transaction
+
+Answers:
+
+> "Do these database changes happen together?"
+
+```text
+BEGIN
+  |
+payment
+  |
+booking
+  |
+seats
+  |
+COMMIT
+```
+
+---
+
+## Idempotency
+
+Answers:
+
+> "What happens if I receive the same operation again?"
+
+```text
+Webhook #1
+Webhook #2
+Webhook #3
+      |
+      v
+same final state
+```
+
+SeatVault requires both.
+
+---
+
+# Successful Payment Test
+
+A fresh booking was created for seats:
+
+```text
+Seat 4
+Seat 5
+```
+
+Payment was initiated.
+
+Payment:
+
+```text
+Payment ID = 2
+Booking ID = 11
+Amount = ₹998
+Status = pending
+Transaction ID = txn_1790771066812
+```
+
+Successful webhook was sent:
+
+```json
+{
+    "transactionId": "txn_1790771066812",
+    "status": "successful"
+}
+```
+
+Result:
+
+```text
+Payment 2:
+pending → successful
+
+Booking 11:
+pending → confirmed
+
+Seat 4:
+held → booked
+
+Seat 5:
+held → booked
+```
+
+Final database verification showed:
+
+```text
+booking_id | booking_status | payment_id | payment_status | seat_id | seat_status
+-----------+----------------+------------+----------------+---------+------------
+11         | confirmed      | 2          | successful     | 4       | booked
+11         | confirmed      | 2          | successful     | 5       | booked
+```
+
+This proved the complete payment flow.
+
+---
+
+# Duplicate Webhook Test
+
+The exact same successful webhook was sent again:
+
+```json
+{
+    "transactionId": "txn_1790771066812",
+    "status": "successful"
+}
+```
+
+The backend returned:
+
+```json
+{
+    "message": "Payment already processed"
+}
+```
+
+No additional confirmation or seat-booking operation was performed.
+
+Therefore the idempotency test passed.
+
+---
+
+# Payment and Expiration Race Condition
+
+The system now protects against:
+
+```text
+Payment webhook
+        VS
+Expiration worker
+```
+
+Both can attempt to modify the same booking.
+
+Both use:
+
+```sql
+FOR UPDATE
+```
+
+on the relevant rows.
+
+Possible outcome:
+
+### Payment wins
+
+```text
+pending
+   ↓
+confirmed
+```
+
+Expiration worker later sees:
+
+```text
+confirmed
+```
+
+and does nothing.
+
+### Expiration wins
+
+```text
+pending
+   ↓
+expired
+```
+
+Payment webhook later sees:
+
+```text
+expired
+```
+
+and rejects the payment confirmation.
+
+This prevents:
+
+```text
+expired → confirmed
+```
+
+---
+
+# BullMQ + Confirmed Booking Test
+
+A delayed expiration job for booking 9 was allowed to execute after booking 9 had already been confirmed.
+
+Worker output:
+
+```text
+Job received: release-hold
+Job data: { bookingId: '9' }
+
+Booking found:
+status: confirmed
+
+Booking 9 is confirmed. No action needed.
+
+Job completed
+```
+
+This demonstrated an important principle:
+
+> A delayed job can become stale.
+
+Therefore the worker must always check the current PostgreSQL state before performing its action.
+
+Redis/BullMQ schedules the work.
+
+PostgreSQL determines the truth.
+
+---
+
+# Current State of the Core Booking System
+
+The main flow is now:
+
+```text
+                    CREATE BOOKING
+                         |
+                         v
+                      PENDING
+                         |
+                    10 minute hold
+                         |
+              +----------+----------+
+              |                     |
+              v                     v
+       PAYMENT SUCCESS          TIME EXPIRES
+              |                     |
+              v                     v
+       PAYMENT SUCCESSFUL        EXPIRED
+              |                     |
+              v                     v
+         CONFIRMED             SEATS RELEASED
+              |
+              v
+        SEATS BOOKED
+```
+
+---
+
+# Important Backend Concepts Learned
+
+## Already implemented
+
+* Express routing
+* Controllers
+* PostgreSQL connection pool
+* PostgreSQL schema design
+* Primary keys
+* Foreign keys
+* Unique constraints
+* Check constraints
+* Relationships
+* SQL joins
+* Transactions
+* COMMIT
+* ROLLBACK
+* `FOR UPDATE`
+* Row-level locking
+* Concurrent state transitions
+* Event-specific seat inventory
+* Temporary seat holds
+* Redis
+* Redis TTL concepts
+* BullMQ
+* Delayed jobs
+* Background workers
+* Booking expiration
+* Payment records
+* Payment initiation
+* Payment webhooks
+* Idempotency
+* Database-level uniqueness
+* Application-level idempotency
+* Atomic payment confirmation
+
+---
+
+# Important Mental Models
+
+## PostgreSQL
+
+PostgreSQL is the source of truth for:
+
+```text
+bookings
+payments
+seat ownership
+seat state
+```
+
+---
+
+## Redis
+
+Redis is used for:
+
+```text
+temporary data
+queue infrastructure
+fast operations
+```
+
+It should not replace PostgreSQL as the permanent source of truth.
+
+---
+
+## BullMQ
+
+BullMQ is responsible for:
+
+```text
+background jobs
+delayed jobs
+retries
+job processing
+```
+
+---
+
+## Worker
+
+The worker:
+
+```text
+does not directly know about bookings
+```
+
+It receives jobs from:
+
+```text
+BullMQ → Redis
+```
+
+and uses the job data:
+
+```js
+job.data.bookingId
+```
+
+to interact with PostgreSQL.
+
+---
+
+# Current Important API Endpoints
+
+## Event / Seat
+
+```text
+GET
+/api/events/:eventId/seats
+```
+
+```text
+POST
+/api/events/:eventId/seats/:eventSeatId/hold
+```
+
+```text
+POST
+/api/events/:eventId/bookings
+```
+
+Temporary/manual confirmation:
+
+```text
+POST
+/api/events/:eventId/bookings/:bookingId/confirm
+```
+
+This endpoint should eventually be removed/refactored because successful payment is now responsible for confirmation.
+
+---
+
+# Payment
+
+Create payment:
+
+```text
+POST
+/api/bookings/:bookingId/payment
+```
+
+Payment webhook:
+
+```text
+POST
+/api/bookings/webhook
+```
+
+---
+
+# Current Database State Used for Testing
+
+Important test records include:
+
+```text
+Booking 9
+confirmed
+```
+
+Booking 11:
+
+```text
+confirmed
+```
+
+Payment 2:
+
+```text
+successful
+```
+
+Booking 11 seats:
+
+```text
+Seat 4 → booked
+Seat 5 → booked
+```
+
+---
+
+# Next Major Feature
+
+## Ticket Generation
+
+After successful payment and booking confirmation, the next major feature is:
+
+```text
+payment successful
+        |
+        v
+booking confirmed
+        |
+        v
+seats booked
+        |
+        v
+ticket generated
+```
+
+The `tickets` table already exists.
+
+It contains:
+
+```text
+id
+booking_id
+ticket_code
+qr_code_data
+status
+issued_at
+```
+
+Important constraint:
+
+```sql
+booking_id UNIQUE
+```
+
+This means one booking can have only one ticket record.
+
+Also:
+
+```sql
+ticket_code UNIQUE
+```
+
+prevents duplicate ticket codes.
+
+---
+
+# Next Concepts To Learn
+
+The next phase will cover:
+
+1. Ticket generation
+2. Unique ticket codes
+3. QR code data
+4. Ticket issuance
+5. Preventing duplicate ticket creation
+6. Ticket validation
+7. Ticket usage / check-in
+8. Payment → ticket consistency
+
+Later:
+
+```text
+Docker Compose
+Redis production setup
+BullMQ retries
+Concurrency testing
+k6 / Artillery
+Payment provider integration
+Authentication integration
+Deployment
+Logging / observability
+```
+
+---
+
+# Current Milestone
+
+## Milestone: Booking + Payment Core Completed
+
+SeatVault can now:
+
+```text
+Create booking
+      ↓
+Hold seats
+      ↓
+Schedule expiration
+      ↓
+Expire booking automatically
+      ↓
+Release seats
+      ↓
+Initiate payment
+      ↓
+Receive payment webhook
+      ↓
+Process successful payment
+      ↓
+Confirm booking
+      ↓
+Book seats
+      ↓
+Handle duplicate webhook safely
+```
+
+This is the first major end-to-end backend milestone of SeatVault.
+
+---
+
+# Recommended Commit
+
+Commit this milestone as:
+
+```bash
+git add .
+git commit -m "feat: implement payment webhook and idempotent booking confirmation"
+git push
+```
+
+This commit represents the completion of:
+
+```text
+Booking
++
+Seat Holds
++
+BullMQ Expiration
++
+Payment Initiation
++
+Payment Webhook
++
+Idempotency
++
+Atomic Payment Confirmation
+```
+
+---
+
+# Next Milestone
+
+After this commit:
+
+```text
+Payment
+   ↓
+Booking confirmed
+   ↓
+Seats booked
+   ↓
+🎟️ Ticket generation
+```
+
+The next implementation phase is **Ticket Generation and Ticket Lifecycle**.
+
+````
+
+### Commit this checkpoint
+
+After replacing your current `LEARNING_LOG.md` with the above:
+
+```bash
+git add .
+git commit -m "feat: implement payment webhook and idempotent booking confirmation"
+git push
+````
+
+This is a **meaningful commit** rather than a tiny code-change commit, which fits the commit strategy you've been following.

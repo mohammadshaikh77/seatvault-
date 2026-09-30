@@ -229,8 +229,84 @@ const createBooking = async (req, res) => {
         client.release();
     }
 };
+
+
+const confirmBooking = async (req, res) => {
+    const { eventId, bookingId } = req.params;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query("BEGIN");
+        const result = await client.query(
+        `SELECT id, user_id, event_id, total_amount, status, expires_at
+         FROM bookings
+         WHERE id = $1
+         FOR UPDATE`,
+        [bookingId]
+        );
+        if (result.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(404).json({
+        message: "Booking not found",
+       });
+     }
+     const booking = result.rows[0];
+     if (Number(booking.event_id) !== Number(eventId)) {
+    await client.query("ROLLBACK");
+
+    return res.status(400).json({
+        message: "Booking does not belong to this event",
+    });
+    }
+    if (booking.status !== "pending") {
+    await client.query("ROLLBACK");
+
+    return res.status(409).json({
+        message: `Booking cannot be confirmed because it is ${booking.status}`,
+    });
+    }
+    if (booking.expires_at && new Date(booking.expires_at) <= new Date()) {
+    await client.query("ROLLBACK");
+
+    return res.status(409).json({
+        message: "Booking has expired",
+    });
+    }
+    await client.query(
+    `UPDATE bookings
+     SET status = 'confirmed',
+         expires_at = NULL,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1`,
+    [bookingId]
+    );
+    await client.query(
+    `UPDATE event_seats AS es
+     SET status = 'booked',
+         updated_at = CURRENT_TIMESTAMP
+     FROM booking_seats AS bs
+     WHERE es.id = bs.event_seat_id
+       AND bs.booking_id = $1
+       AND es.status = 'held'`,
+    [bookingId]
+    );
+    await client.query("COMMIT");
+    return res.status(200).json({
+    message: "Booking confirmed successfully",
+    bookingId: booking.id,
+    });
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+};
 module.exports = {
     getAvailableSeats,
     holdSeat,
     createBooking,
+    confirmBooking,
 };
