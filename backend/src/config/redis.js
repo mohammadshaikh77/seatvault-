@@ -42,8 +42,7 @@ const connectRedis = async () => {
    const seat2 = await redisClient.get("hold:event:1:seat:2");
 const seat3 = await redisClient.get("hold:event:1:seat:3");
 
-console.log("Seat 2 hold:", seat2);
-console.log("Seat 3 hold:", seat3);
+
 };
 
 module.exports = {

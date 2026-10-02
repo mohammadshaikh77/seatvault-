@@ -11195,3 +11195,578 @@ git push
 ````
 
 This is a **meaningful commit** rather than a tiny code-change commit, which fits the commit strategy you've been following.
+
+
+Yes. Add this **Ticket Generation & Issuance** section to your `LEARNING_LOG.md`.
+
+````md
+# SeatVault Learning Log
+
+## Ticket Generation & Issuance
+
+### What I implemented
+
+Implemented the ticket-generation flow after successful booking/payment confirmation.
+
+The ticket system was designed around `booking_seats` rather than directly attaching one ticket to an entire booking.
+
+Final relationship:
+
+```text
+Booking
+   |
+   +-- Booking Seat 19
+   |       |
+   |       +-- Ticket 1
+   |
+   +-- Booking Seat 20
+           |
+           +-- Ticket 2
+````
+
+This allows a single booking containing multiple seats to have an individual ticket for each seat.
+
+---
+
+### Ticket Database Design
+
+Initially, the `tickets` table had:
+
+```sql
+booking_id BIGINT NOT NULL UNIQUE
+```
+
+This meant:
+
+```text
+One booking → One ticket
+```
+
+This was changed because one booking can contain multiple seats.
+
+Added:
+
+```sql
+booking_seat_id BIGINT
+```
+
+with a foreign key:
+
+```sql
+FOREIGN KEY (booking_seat_id)
+REFERENCES booking_seats(id)
+```
+
+Removed the old unique constraint:
+
+```sql
+UNIQUE (booking_id)
+```
+
+Added:
+
+```sql
+UNIQUE (booking_seat_id)
+```
+
+The final rule is:
+
+```text
+One booking
+    ↓
+Many booking_seats
+    ↓
+Each booking_seat
+    ↓
+At most one ticket
+```
+
+This gives the database-level rule:
+
+> One booking seat can have at most one ticket.
+
+---
+
+### Why `booking_seat_id` is important
+
+A booking can contain multiple seats.
+
+For example:
+
+```text
+Booking 11
+├── Booking Seat 19 → Physical Seat 4
+└── Booking Seat 20 → Physical Seat 5
+```
+
+Therefore tickets should identify the exact seat they belong to:
+
+```text
+Ticket 1 → Booking Seat 19 → Seat 4
+
+Ticket 2 → Booking Seat 20 → Seat 5
+```
+
+This is more useful for future ticket validation and QR-code scanning because each ticket can represent a specific seat.
+
+---
+
+### Ticket Creation Endpoint
+
+Updated the endpoint from:
+
+```http
+POST /api/bookings/:bookingId/ticket
+```
+
+to:
+
+```http
+POST /api/bookings/:bookingId/seats/:bookingSeatId/ticket
+```
+
+Example:
+
+```http
+POST /api/bookings/11/seats/20/ticket
+```
+
+Parameters:
+
+```text
+bookingId = 11
+bookingSeatId = 20
+```
+
+---
+
+### Ticket Creation Flow
+
+The controller follows this transaction flow:
+
+```text
+BEGIN
+  ↓
+Find booking and lock it
+  ↓
+Check booking exists
+  ↓
+Check booking is confirmed
+  ↓
+Find booking_seat
+  ↓
+Verify booking_seat belongs to booking
+  ↓
+Check whether ticket already exists
+  ↓
+Generate unique ticket code
+  ↓
+Insert ticket
+  ↓
+COMMIT
+```
+
+---
+
+### Booking Validation
+
+Tickets can only be generated for confirmed bookings.
+
+Allowed:
+
+```text
+confirmed → ticket can be created
+```
+
+Rejected:
+
+```text
+pending
+expired
+cancelled
+refunded
+```
+
+The controller checks:
+
+```js
+if (booking.status !== "confirmed") {
+    await client.query("ROLLBACK");
+
+    return res.status(409).json({
+        message: `Ticket cannot be created because booking is ${booking.status}`,
+    });
+}
+```
+
+---
+
+### Booking Seat Ownership Validation
+
+The controller verifies that the requested `bookingSeatId` actually belongs to the provided `bookingId`.
+
+SQL:
+
+```sql
+SELECT id, booking_id, event_seat_id, price_at_booking
+FROM booking_seats
+WHERE id = $1
+  AND booking_id = $2
+```
+
+This prevents a request such as:
+
+```text
+Booking 11
++
+Booking Seat belonging to Booking 12
+```
+
+from creating an invalid ticket relationship.
+
+---
+
+### Ticket Code Generation
+
+Used Node.js `crypto` to generate ticket codes:
+
+```js
+const ticketCode = `TKT-${crypto
+    .randomBytes(8)
+    .toString("hex")
+    .toUpperCase()}`;
+```
+
+Example:
+
+```text
+TKT-A2335C87A3BA8533
+TKT-B3352998226D7368
+```
+
+The database also has:
+
+```sql
+UNIQUE (ticket_code)
+```
+
+so duplicate ticket codes are prevented at the database level.
+
+---
+
+### QR Code Data
+
+For the current learning implementation:
+
+```text
+qr_code_data = ticket_code
+```
+
+No actual QR image is generated yet.
+
+The ticket code can later be encoded into a real QR code.
+
+---
+
+### Ticket Idempotency
+
+Ticket creation was made idempotent at the `booking_seat` level.
+
+Before creating a ticket, the controller checks:
+
+```sql
+SELECT id, booking_id, booking_seat_id, ticket_code, status
+FROM tickets
+WHERE booking_seat_id = $1
+FOR UPDATE
+```
+
+If a ticket already exists, the existing ticket is returned:
+
+```json
+{
+    "message": "Ticket already exists",
+    "ticket": {
+        "id": "2",
+        "booking_id": "11",
+        "booking_seat_id": "20",
+        "ticket_code": "TKT-B3352998226D7368",
+        "status": "valid"
+    }
+}
+```
+
+Therefore:
+
+```text
+First request
+    ↓
+Create ticket
+    ↓
+201 Created
+
+Same request again
+    ↓
+Existing ticket found
+    ↓
+200 OK
+    ↓
+Same ticket returned
+```
+
+This prevents duplicate ticket creation when the same request is repeated.
+
+---
+
+### Transaction Handling
+
+Ticket creation uses PostgreSQL transactions:
+
+```js
+await client.query("BEGIN");
+```
+
+Successful operation:
+
+```js
+await client.query("COMMIT");
+```
+
+Failed operation:
+
+```js
+await client.query("ROLLBACK");
+```
+
+The PostgreSQL connection is always released:
+
+```js
+finally {
+    client.release();
+}
+```
+
+This ensures ticket creation is atomic.
+
+---
+
+### Database Constraints Added
+
+The final `tickets` table uses:
+
+```text
+PRIMARY KEY
+    tickets.id
+
+FOREIGN KEY
+    tickets.booking_id → bookings.id
+
+FOREIGN KEY
+    tickets.booking_seat_id → booking_seats.id
+
+UNIQUE
+    tickets.booking_seat_id
+
+UNIQUE
+    tickets.ticket_code
+```
+
+These constraints provide database-level protection in addition to application-level checks.
+
+---
+
+### Testing Performed
+
+#### Test 1 — Create ticket for first booking seat
+
+Booking:
+
+```text
+11
+```
+
+Booking seat:
+
+```text
+19
+```
+
+Ticket created successfully:
+
+```text
+Ticket ID: 1
+Ticket Code: TKT-A2335C87A3BA8533
+Status: valid
+```
+
+---
+
+#### Test 2 — Create ticket for second booking seat
+
+Request:
+
+```http
+POST /api/bookings/11/seats/20/ticket
+```
+
+Result:
+
+```text
+Ticket ID: 2
+Booking ID: 11
+Booking Seat ID: 20
+Ticket Code: TKT-B3352998226D7368
+Status: valid
+```
+
+---
+
+#### Test 3 — Repeat the same ticket request
+
+Repeated:
+
+```http
+POST /api/bookings/11/seats/20/ticket
+```
+
+Result:
+
+```text
+Ticket already exists
+```
+
+The same Ticket ID `2` was returned.
+
+No Ticket `3` was created.
+
+---
+
+### Final Database Verification
+
+Verified using a join across:
+
+```text
+tickets
+    ↓
+booking_seats
+    ↓
+event_seats
+    ↓
+seats
+```
+
+Final result:
+
+```text
+ticket_id | booking_id | booking_seat_id | event_seat_id | seat | ticket_code
+----------+------------+-----------------+---------------+------+----------------------
+1         | 11         | 19              | 4             | 4    | TKT-A2335C87A3BA8533
+2         | 11         | 20              | 5             | 5    | TKT-B3352998226D7368
+```
+
+Both tickets have:
+
+```text
+status = valid
+```
+
+Final relationship:
+
+```text
+Booking 11
+│
+├── Booking Seat 19
+│      └── Event Seat 4
+│             └── Physical Seat 4
+│                    └── Ticket 1
+│
+└── Booking Seat 20
+       └── Event Seat 5
+              └── Physical Seat 5
+                     └── Ticket 2
+```
+
+---
+
+### Important Design Decision
+
+Ticket creation currently exists as a separate endpoint for learning and testing:
+
+```text
+Payment successful
+      ↓
+Booking confirmed
+      ↓
+Client calls ticket endpoint
+      ↓
+Ticket created
+```
+
+The intended final architecture is:
+
+```text
+Payment Webhook
+      ↓
+Payment successful
+      ↓
+Booking confirmed
+      ↓
+Seats marked booked
+      ↓
+Ticket(s) issued
+```
+
+Therefore, ticket generation should eventually be integrated into the successful payment flow rather than relying on the client to manually request ticket creation.
+
+---
+
+### Key Concepts Learned
+
+* One-to-many relationship between bookings and booking seats
+* Foreign key relationships
+* Database constraints
+* Unique constraints
+* Ticket-to-seat association
+* Transactional ticket creation
+* Row-level locking with `FOR UPDATE`
+* Idempotent resource creation
+* Secure random identifier generation with Node.js `crypto`
+* Application-level validation + database-level protection
+* Using SQL joins to verify relationships
+* Designing ticket systems around individual event seats
+
+---
+
+## Ticket Phase Status
+
+```text
+Database design              ✅
+Ticket table modification    ✅
+booking_seat relationship    ✅
+Ticket generation            ✅
+Unique ticket codes          ✅
+Ticket idempotency           ✅
+Transaction handling         ✅
+Postman testing              ✅
+Database verification        ✅
+```
+
+Next planned step:
+
+```text
+Integrate ticket issuance into the successful payment webhook
+```
+
+````
+
+### Commit
+
+After replacing/updating `LEARNING_LOG.md`:
+
+```bash
+git add .
+git commit -m "feat: implement per-seat ticket generation"
+git push
+````
+
+This is a good checkpoint because the entire **ticket-generation milestone** is now complete.
