@@ -1,5 +1,6 @@
 const { pool } = require("../config/db");
 const holdQueue = require("../queues/hold.queue");
+const { redisClient } = require("../config/redis");
 
 const getAvailableSeats = async (req, res) => {
     const { eventId } = req.params;
@@ -199,6 +200,20 @@ const createBooking = async (req, res) => {
         console.log("All seats are available:", result.rows);
 
         await client.query("COMMIT");
+
+        await redisClient.set(
+    `seatvault:hold:booking:${booking.id}`,
+    JSON.stringify({
+        bookingId: booking.id,
+        eventId: Number(eventId),
+        seatIds: sortedSeatIds,
+    }),
+    {
+        EX: 600,
+    }
+      );
+
+      
 
         const delayMs =
     new Date(booking.expires_at).getTime() - Date.now();

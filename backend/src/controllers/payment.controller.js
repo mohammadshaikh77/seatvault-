@@ -1,4 +1,5 @@
 const { pool } = require("../config/db");
+const { redisClient } = require("../config/redis");
 const createPayment = async (req, res) => {
     const { bookingId } = req.params;
 
@@ -193,6 +194,9 @@ const handlePaymentWebhook = async (req, res) => {
     );
 
     await client.query("COMMIT");
+    await redisClient.del(
+    `seatvault:hold:booking:${payment.booking_id}`
+);
 
     return res.status(200).json({
     message: "Payment processed successfully",

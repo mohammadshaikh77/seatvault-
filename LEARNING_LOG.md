@@ -11770,3 +11770,440 @@ git push
 ````
 
 This is a good checkpoint because the entire **ticket-generation milestone** is now complete.
+
+
+Absolutely. Add this section to your `LEARNING_LOG.md` for the commit.
+
+```md
+## Redis Temporary Seat Holds
+
+### What Was Implemented
+
+Integrated Redis into the SeatVault temporary seat-holding system.
+
+The booking flow now uses:
+
+- PostgreSQL as the source of truth for booking and seat state
+- Redis for temporary hold information and TTL
+- BullMQ for delayed hold-expiration jobs
+
+The final flow is:
+
+User selects seats
+→ PostgreSQL transaction
+→ Seats marked as `held`
+→ Transaction committed
+→ Redis hold created with 10-minute TTL
+→ BullMQ expiration job scheduled
+
+---
+
+### Why Redis Was Added
+
+The existing system was already able to hold seats using PostgreSQL and BullMQ.
+
+Redis was introduced because temporary seat-hold information is short-lived data and Redis provides:
+
+- Fast access
+- TTL-based expiration
+- Automatic removal of temporary data
+- A suitable place to store active temporary hold information
+
+PostgreSQL remains the source of truth.
+
+Redis does **not** determine whether a seat is actually available.
+
+---
+
+### Redis Hold Key Design
+
+Each booking gets a dedicated Redis key:
+
+```text
+seatvault:hold:booking:<bookingId>
+```
+
+Example:
+
+```text
+seatvault:hold:booking:12
+```
+
+The value contains:
+
+```json
+{
+  "bookingId": 12,
+  "eventId": 1,
+  "seatIds": [6, 7]
+}
+```
+
+The key is created with a 10-minute TTL:
+
+```js
+await redisClient.set(
+    `seatvault:hold:booking:${booking.id}`,
+    JSON.stringify({
+        bookingId: booking.id,
+        eventId: Number(eventId),
+        seatIds: sortedSeatIds,
+    }),
+    {
+        EX: 600,
+    }
+);
+```
+
+---
+
+### Redis TTL
+
+TTL means **Time To Live**.
+
+A key created with:
+
+```text
+EX: 600
+```
+
+remains in Redis for approximately 600 seconds.
+
+The remaining lifetime can be checked using:
+
+```redis
+TTL seatvault:hold:booking:12
+```
+
+Example:
+
+```text
+544
+```
+
+The TTL decreases automatically and Redis removes the key when the TTL reaches zero.
+
+---
+
+### PostgreSQL and Redis Responsibilities
+
+A major architectural distinction learned in this phase:
+
+#### PostgreSQL
+
+Responsible for permanent business state:
+
+```text
+users
+events
+seats
+event_seats
+bookings
+payments
+tickets
+```
+
+It remains the **source of truth**.
+
+#### Redis
+
+Responsible for temporary hold information:
+
+```text
+seatvault:hold:booking:<bookingId>
+```
+
+Redis stores the active temporary hold and its expiration time.
+
+Redis does not replace PostgreSQL.
+
+---
+
+### Booking Creation Flow
+
+The booking controller now follows:
+
+```text
+1. Begin PostgreSQL transaction
+        ↓
+2. Lock event seats using FOR UPDATE
+        ↓
+3. Verify seats are available
+        ↓
+4. Create booking
+        ↓
+5. Create booking_seats
+        ↓
+6. Mark event_seats as held
+        ↓
+7. COMMIT PostgreSQL transaction
+        ↓
+8. Create Redis hold with 600-second TTL
+        ↓
+9. Schedule BullMQ expiration job
+```
+
+Redis is created **after the PostgreSQL transaction commits**.
+
+This prevents creating a Redis hold for a PostgreSQL transaction that eventually rolls back.
+
+---
+
+### Redis Hold Cleanup After Successful Payment
+
+When payment succeeds:
+
+```text
+Payment webhook
+      ↓
+Payment → successful
+      ↓
+Booking → confirmed
+      ↓
+Seats → booked
+      ↓
+PostgreSQL COMMIT
+      ↓
+Redis hold deleted
+```
+
+The Redis key is deleted using:
+
+```js
+await redisClient.del(
+    `seatvault:hold:booking:${payment.booking_id}`
+);
+```
+
+This prevents a confirmed booking from continuing to have an unnecessary temporary Redis hold.
+
+---
+
+### Redis Cleanup During Hold Expiration
+
+The BullMQ hold-expiration worker was also updated.
+
+The expiration flow is now:
+
+```text
+BullMQ delayed job
+        ↓
+Worker
+        ↓
+Begin PostgreSQL transaction
+        ↓
+Lock booking
+        ↓
+Check booking status
+        ↓
+Booking → expired
+        ↓
+Held seats → available
+        ↓
+COMMIT
+        ↓
+Delete Redis hold
+```
+
+The Redis key is deleted only after the PostgreSQL transaction commits successfully:
+
+```js
+await client.query("COMMIT");
+
+await redisClient.del(
+    `seatvault:hold:booking:${bookingId}`
+);
+```
+
+---
+
+### Important Reliability Lesson
+
+One important issue was observed during testing.
+
+A PostgreSQL transaction can successfully commit while a Redis operation performed afterward can fail.
+
+For example:
+
+```text
+PostgreSQL
+    ↓
+Booking confirmed
+    ↓
+Seats booked
+    ↓
+COMMIT
+    ↓
+Redis operation
+    ↓
+ERROR
+```
+
+This demonstrated why PostgreSQL must remain the source of truth.
+
+Redis is supporting temporary state, not controlling the actual booking state.
+
+---
+
+### Testing Performed
+
+#### Manual Redis TTL test
+
+Created a temporary key:
+
+```redis
+SET seatvault:hold:booking:999 '{"bookingId":999,"eventId":1,"seatIds":[4,5]}' EX 60
+```
+
+Verified:
+
+```redis
+GET seatvault:hold:booking:999
+```
+
+and:
+
+```redis
+TTL seatvault:hold:booking:999
+```
+
+The TTL decreased over time and the key eventually expired.
+
+---
+
+### Actual Booking Test
+
+Created Booking 12 for seats 6 and 7.
+
+Redis contained:
+
+```text
+seatvault:hold:booking:12
+```
+
+with:
+
+```json
+{
+    "bookingId": "12",
+    "eventId": 1,
+    "seatIds": [6, 7]
+}
+```
+
+The Redis TTL was approximately 10 minutes.
+
+---
+
+### Payment Integration Test
+
+Booking 13 was created for seats 6 and 7.
+
+Payment was successfully processed.
+
+Final database state:
+
+```text
+Booking 13 → confirmed
+Seat 6 → booked
+Seat 7 → booked
+```
+
+Redis verification:
+
+```redis
+GET seatvault:hold:booking:13
+```
+
+returned:
+
+```text
+(nil)
+```
+
+This confirmed that the Redis temporary hold was removed after successful payment.
+
+---
+
+### Concepts Learned
+
+- Redis key-value storage
+- Redis TTL
+- `SET` with `EX`
+- `GET`
+- `TTL`
+- `DEL`
+- Temporary state vs permanent state
+- PostgreSQL as the source of truth
+- Redis as a temporary state store
+- Redis integration with an Express backend
+- Redis interaction after PostgreSQL transactions
+- BullMQ + Redis + PostgreSQL working together
+- Handling consistency between PostgreSQL and Redis
+- Why Redis should not replace the database for booking state
+
+---
+
+### Architecture After This Phase
+
+```text
+                    SeatVault
+                        |
+              ┌─────────┴─────────┐
+              ↓                   ↓
+         PostgreSQL             Redis
+       Source of Truth       Temporary Holds
+              |                   |
+              |              TTL / Hold Data
+              |
+              ↓
+          BullMQ Worker
+              |
+              ↓
+       Hold Expiration
+              |
+              ↓
+        PostgreSQL Update
+              |
+              ↓
+          Redis Cleanup
+```
+
+---
+
+### Phase Status
+
+**Phase 13 — Redis Temporary Seat Holds: COMPLETED**
+
+The SeatVault booking system now uses Redis for temporary seat-hold state while PostgreSQL remains the authoritative source for booking and seat state.
+
+### Next Phase
+
+**Phase 14 — Booking Lifecycle**
+
+Planned states and transitions:
+
+```text
+PENDING
+   ├── payment success → CONFIRMED
+   ├── hold expiration → EXPIRED
+   └── cancellation → CANCELLED
+
+CONFIRMED
+   └── refund → REFUNDED
+```
+
+The next phase will focus on keeping bookings, seats, payments, and tickets consistent when these state transitions occur.
+```
+
+### Commit
+
+After adding this to `LEARNING_LOG.md`:
+
+```bash
+git add .
+git commit -m "feat: integrate redis temporary seat holds"
+git push
+```
+
+Once you've committed, we'll move directly to **Booking Lifecycle**.

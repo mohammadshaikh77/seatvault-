@@ -1,5 +1,6 @@
 const { Worker } = require("bullmq");
 const { pool } = require("../config/db");
+const { redisClient } = require("../config/redis");
 
 const holdWorker = new Worker(
     "seat-hold",
@@ -68,6 +69,7 @@ const holdWorker = new Worker(
             );
 
             await client.query("COMMIT");
+            await redisClient.del(`seatvault:hold:booking:${bookingId}`);
 
             console.log(`Booking ${bookingId} expired`);
             console.log(`Seats for booking ${bookingId} released`);
