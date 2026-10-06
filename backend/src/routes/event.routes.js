@@ -5,6 +5,7 @@ const {
     createBooking,
     confirmBooking,
      cancelBooking,
+     refundBooking,
 } = require("../controllers/event.controller");
 
 const router = express.Router();
@@ -14,4 +15,8 @@ router.post("/:eventId/seats/:eventSeatId/hold", holdSeat);
 router.post("/:eventId/bookings", createBooking);
 router.post("/:eventId/bookings/:bookingId/confirm", confirmBooking);
 router.post("/:eventId/bookings/:bookingId/cancel", cancelBooking);
+router.post(
+    "/:eventId/bookings/:bookingId/refund",
+    refundBooking
+);
 module.exports = router;

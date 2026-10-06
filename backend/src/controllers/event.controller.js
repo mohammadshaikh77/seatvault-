@@ -405,10 +405,137 @@ const cancelBooking = async (req, res) => {
         client.release();
     }
 };
+
+
+const refundBooking = async (req, res) => {
+    const { eventId, bookingId } = req.params;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query("BEGIN");
+
+        // 1. Find and lock the booking
+        const bookingResult = await client.query(
+            `SELECT id, user_id, event_id, total_amount, status
+             FROM bookings
+             WHERE id = $1
+             FOR UPDATE`,
+            [bookingId]
+        );
+
+        if (bookingResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            return res.status(404).json({
+                message: "Booking not found",
+            });
+        }
+
+        const booking = bookingResult.rows[0];
+
+        // 2. Make sure booking belongs to this event
+        if (Number(booking.event_id) !== Number(eventId)) {
+            await client.query("ROLLBACK");
+
+            return res.status(400).json({
+                message: "Booking does not belong to this event",
+            });
+        }
+
+        // 3. Only confirmed bookings can be refunded
+        if (booking.status !== "confirmed") {
+            await client.query("ROLLBACK");
+
+            return res.status(409).json({
+                message: `Booking cannot be refunded because it is ${booking.status}`,
+            });
+        }
+
+        // 4. Find and lock the successful payment
+        const paymentResult = await client.query(
+            `SELECT id, booking_id, amount, status, transaction_id
+             FROM payments
+             WHERE booking_id = $1
+               AND status = 'successful'
+             FOR UPDATE`,
+            [bookingId]
+        );
+
+        if (paymentResult.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            return res.status(404).json({
+                message: "Successful payment not found",
+            });
+        }
+
+        const payment = paymentResult.rows[0];
+
+        // 5. Mark payment as refunded
+        await client.query(
+            `UPDATE payments
+             SET status = 'refunded',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1`,
+            [payment.id]
+        );
+
+        // 6. Mark booking as refunded
+        await client.query(
+            `UPDATE bookings
+             SET status = 'refunded',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1`,
+            [bookingId]
+        );
+
+        // 7. Release the booked seats
+        await client.query(
+            `UPDATE event_seats AS es
+             SET status = 'available',
+                 updated_at = CURRENT_TIMESTAMP
+             FROM booking_seats AS bs
+             WHERE es.id = bs.event_seat_id
+               AND bs.booking_id = $1
+               AND es.status = 'booked'`,
+            [bookingId]
+        );
+
+        // 8. Cancel tickets belonging to this booking
+        await client.query(
+            `UPDATE tickets
+             SET status = 'cancelled'
+             WHERE booking_id = $1
+               AND status = 'valid'`,
+            [bookingId]
+        );
+
+        // 9. Commit all database changes
+        await client.query("COMMIT");
+
+        // 10. Remove any Redis hold
+        await redisClient.del(
+            `seatvault:hold:booking:${bookingId}`
+        );
+
+        return res.status(200).json({
+            message: "Refund processed successfully",
+            bookingId: booking.id,
+            paymentId: payment.id,
+        });
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+};
 module.exports = {
     getAvailableSeats,
     holdSeat,
     createBooking,
     confirmBooking,
     cancelBooking,
+    refundBooking,
 };
