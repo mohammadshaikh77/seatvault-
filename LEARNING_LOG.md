@@ -12207,3 +12207,1786 @@ git push
 ```
 
 Once you've committed, we'll move directly to **Booking Lifecycle**.
+
+
+Got it — you want the **`LEARNING_LOG.md` only up to the most recent completed commit/checkpoint**, not the whole SeatVault project.
+
+Based on the work completed so far, that means covering:
+
+1. PostgreSQL database setup + schema
+2. Backend setup
+3. Booking + transactional seat locking
+4. Payment flow + webhook + idempotency
+5. Per-seat ticket generation
+6. Redis temporary holds + BullMQ expiration
+7. Pending booking cancellation
+
+And **stop there** — do not include the upcoming refund phase.
+
+You can use this as your current `LEARNING_LOG.md`:
+
+```md
+# SeatVault — Learning Log
+
+> A backend-first learning project focused on building a real-world event ticket booking system.
+>
+> **Stack:** Node.js, Express.js, PostgreSQL, Redis, BullMQ  
+> **Architecture:** Modular Monolith  
+> **Testing:** Postman  
+> **Goal:** Learn real backend concepts such as relational database design, transactions, row-level locking, concurrency handling, Redis TTL, background jobs, payment webhooks, idempotency, and booking lifecycle management.
+
+---
+
+# Phase 1 — Project Setup
+
+## Goal
+
+Set up the initial SeatVault workspace and define the project architecture before writing the backend.
+
+## Project Structure
+
+```text
+seatvault/
+│
+├── backend/
+│
+├── docs/
+│   ├── requirements.md
+│   ├── architecture.md
+│   └── database-schema.md
+│
+├── LEARNING_LOG.md
+└── README.md
+```
+
+## Architecture
+
+SeatVault follows a **modular monolithic architecture**.
+
+Basic request flow:
+
+```text
+Client
+   ↓
+Route
+   ↓
+Middleware
+   ↓
+Controller
+   ↓
+Service / Database / Redis
+   ↓
+Response
+```
+
+The project is intentionally backend-first.
+
+The main focus is understanding the backend systems involved in reliable ticket booking rather than building a large frontend.
+
+## Initial Git Commit
+
+```bash
+git add .
+git commit -m "chore: initialize SeatVault project workspace"
+git push
+```
+
+---
+
+# Phase 2 — PostgreSQL Setup
+
+## Why PostgreSQL?
+
+SeatVault deals with strongly related data:
+
+- users
+- venues
+- seats
+- events
+- event-specific seats
+- bookings
+- booking seats
+- payments
+- tickets
+
+A relational database is useful because we need:
+
+- Foreign keys
+- Constraints
+- Transactions
+- Consistent relationships
+- Row-level locking
+- Reliable booking state
+
+PostgreSQL became the **source of truth** for SeatVault.
+
+---
+
+# Phase 3 — Database Schema
+
+## 3.1 Users
+
+The `users` table stores application users.
+
+Important fields:
+
+```text
+id
+name
+email
+password_hash
+role
+created_at
+updated_at
+```
+
+Roles currently include:
+
+```text
+buyer
+organizer
+admin
+```
+
+The email is unique.
+
+---
+
+## 3.2 Venues
+
+A venue represents a physical location where events happen.
+
+Important fields:
+
+```text
+id
+name
+address
+city
+capacity
+created_by
+created_at
+updated_at
+```
+
+`created_by` references the `users` table.
+
+Relationship:
+
+```text
+User
+  ↓
+Venue
+```
+
+One user can create multiple venues.
+
+---
+
+## 3.3 Events
+
+An event belongs to a venue.
+
+Important fields:
+
+```text
+id
+venue_id
+name
+description
+event_date
+status
+created_by
+created_at
+updated_at
+```
+
+Event status:
+
+```text
+draft
+published
+cancelled
+completed
+```
+
+Relationships:
+
+```text
+Venue
+  ↓
+Events
+```
+
+and:
+
+```text
+User
+  ↓
+Events
+```
+
+---
+
+# Phase 4 — Physical Seats vs Event Seats
+
+This was one of the important database design concepts in SeatVault.
+
+## Physical Seat
+
+The `seats` table represents the actual physical seats inside a venue.
+
+Example:
+
+```text
+Venue: SeatVault Arena
+
+Section A
+Row 1
+Seat 1
+Seat 2
+Seat 3
+Seat 4
+Seat 5
+```
+
+These seats belong to the venue itself.
+
+---
+
+## Event Seat
+
+The same physical venue can host multiple events.
+
+Therefore, the physical seat cannot directly store booking status for an event.
+
+Instead we created:
+
+```text
+event_seats
+```
+
+An `event_seats` row connects:
+
+```text
+Event + Physical Seat
+```
+
+and stores event-specific information such as:
+
+```text
+price
+status
+```
+
+Example:
+
+```text
+Seat A1
+    ↓
+Event 1 → ₹499 → available
+
+Seat A1
+    ↓
+Event 2 → ₹699 → booked
+```
+
+The physical seat is reused, but its availability is different for each event.
+
+This prevents us from incorrectly marking a physical seat as globally booked.
+
+---
+
+# Phase 5 — Event Seat Inventory
+
+The `event_seats` table contains:
+
+```text
+id
+event_id
+seat_id
+price
+status
+created_at
+updated_at
+```
+
+Possible statuses:
+
+```text
+available
+held
+booked
+blocked
+```
+
+A unique constraint was added:
+
+```text
+UNIQUE(event_id, seat_id)
+```
+
+This guarantees that the same physical seat cannot be added twice for the same event.
+
+---
+
+# Phase 6 — Booking Database Design
+
+## Bookings
+
+The `bookings` table represents the overall booking.
+
+Important fields:
+
+```text
+id
+user_id
+event_id
+total_amount
+status
+expires_at
+created_at
+updated_at
+```
+
+Booking statuses:
+
+```text
+pending
+confirmed
+expired
+cancelled
+refunded
+```
+
+---
+
+## Booking Seats
+
+A booking can contain multiple seats.
+
+Therefore we created:
+
+```text
+booking_seats
+```
+
+It connects:
+
+```text
+Booking
+   ↓
+Booking Seat
+   ↓
+Event Seat
+```
+
+Important fields:
+
+```text
+id
+booking_id
+event_seat_id
+price_at_booking
+created_at
+```
+
+`price_at_booking` stores the price at the time of booking.
+
+This is important because the event seat's current price could change later.
+
+---
+
+# Phase 7 — Payments Table
+
+The `payments` table represents payment information.
+
+Important fields:
+
+```text
+id
+booking_id
+amount
+payment_method
+status
+transaction_id
+created_at
+updated_at
+```
+
+Payment statuses:
+
+```text
+pending
+successful
+failed
+refunded
+```
+
+`transaction_id` is unique.
+
+This is useful for preventing duplicate payment records.
+
+---
+
+# Phase 8 — Tickets Table
+
+Initially, the ticket design used:
+
+```text
+booking_id UNIQUE
+```
+
+This meant one booking could only have one ticket.
+
+That was incorrect because a booking can contain multiple seats.
+
+Example:
+
+```text
+Booking 11
+ ├── Seat 4
+ └── Seat 5
+```
+
+Each seat should have its own ticket.
+
+Therefore the design was changed to:
+
+```text
+booking_seat_id
+```
+
+with:
+
+```text
+UNIQUE(booking_seat_id)
+```
+
+Final relationship:
+
+```text
+Booking
+   ↓
+Booking Seats
+   ↓
+Tickets
+```
+
+Example:
+
+```text
+Booking 11
+
+Booking Seat 19 → Ticket 1
+Booking Seat 20 → Ticket 2
+```
+
+This was an important database modelling correction.
+
+---
+
+# Phase 9 — Backend Setup
+
+## Technologies
+
+Backend:
+
+```text
+Node.js
+Express.js
+PostgreSQL
+pg
+dotenv
+nodemon
+```
+
+Dependencies:
+
+```bash
+npm install express pg dotenv
+npm install -D nodemon
+```
+
+---
+
+## PostgreSQL Connection
+
+Created:
+
+```text
+backend/src/config/db.js
+```
+
+A PostgreSQL connection pool is used.
+
+The pool allows the application to reuse database connections instead of creating a new connection for every query.
+
+Connection is tested using:
+
+```sql
+SELECT NOW()
+```
+
+---
+
+# Phase 10 — Booking Creation
+
+## Goal
+
+Allow a user to select seats and temporarily reserve them.
+
+Example:
+
+```http
+POST /api/events/1/bookings
+```
+
+Request:
+
+```json
+{
+    "userId": 1,
+    "seatIds": [4, 5]
+}
+```
+
+---
+
+# Phase 11 — Transactional Seat Booking
+
+This was one of the most important backend concepts in SeatVault.
+
+When creating a booking, multiple database operations must succeed together.
+
+The transaction flow is:
+
+```text
+BEGIN
+   ↓
+Lock event seats
+   ↓
+Check availability
+   ↓
+Create booking
+   ↓
+Create booking_seats
+   ↓
+Mark event seats as held
+   ↓
+COMMIT
+```
+
+If something fails:
+
+```text
+ROLLBACK
+```
+
+This prevents partial booking state.
+
+---
+
+# Phase 12 — Row-Level Locking
+
+The booking query uses:
+
+```sql
+FOR UPDATE
+```
+
+Example:
+
+```sql
+SELECT id, seat_id, price, status
+FROM event_seats
+WHERE event_id = $1
+  AND seat_id = ANY($2)
+ORDER BY seat_id
+FOR UPDATE;
+```
+
+This locks the selected rows during the transaction.
+
+## Why?
+
+Suppose two users try to book:
+
+```text
+Seat 4
+```
+
+at exactly the same time.
+
+Without locking:
+
+```text
+User A → sees available
+User B → sees available
+
+User A → books
+User B → books
+```
+
+This could cause double booking.
+
+With:
+
+```sql
+FOR UPDATE
+```
+
+one transaction gets the lock first.
+
+The second transaction has to wait.
+
+After the first transaction changes the seat:
+
+```text
+available → held
+```
+
+the second transaction sees that the seat is no longer available.
+
+Therefore:
+
+```text
+Double booking prevented
+```
+
+---
+
+# Phase 13 — Sorting Seat IDs Before Locking
+
+Before querying the seats, the requested seat IDs are sorted:
+
+```js
+const sortedSeatIds = [...seatIds].sort((a, b) => a - b);
+```
+
+This gives transactions a consistent locking order.
+
+Example:
+
+```text
+Request A: [5, 4]
+Request B: [4, 5]
+```
+
+Both become:
+
+```text
+[4, 5]
+```
+
+This reduces the possibility of transactions acquiring locks in conflicting orders.
+
+This is an important concurrency concept.
+
+---
+
+# Phase 14 — Temporary Booking Holds
+
+A newly created booking starts as:
+
+```text
+pending
+```
+
+and its seats become:
+
+```text
+held
+```
+
+The booking receives an expiration time:
+
+```text
+CURRENT_TIMESTAMP + 10 minutes
+```
+
+Example:
+
+```text
+Booking
+status = pending
+
+Seat 4
+status = held
+
+Seat 5
+status = held
+```
+
+The user gets a limited amount of time to complete payment.
+
+---
+
+# Phase 15 — Redis Setup
+
+Redis was introduced for temporary seat-hold information.
+
+Important concept:
+
+> Redis does NOT replace PostgreSQL.
+
+PostgreSQL remains the source of truth.
+
+Redis is used for temporary information and fast access.
+
+---
+
+## Redis Key Design
+
+For each booking:
+
+```text
+seatvault:hold:booking:<bookingId>
+```
+
+Example:
+
+```text
+seatvault:hold:booking:13
+```
+
+Value:
+
+```json
+{
+    "bookingId": 13,
+    "eventId": 1,
+    "seatIds": [6, 7]
+}
+```
+
+---
+
+# Phase 16 — Redis TTL
+
+The Redis hold is stored with:
+
+```text
+EX = 600
+```
+
+which means:
+
+```text
+600 seconds
+= 10 minutes
+```
+
+Example:
+
+```js
+await redisClient.set(
+    `seatvault:hold:booking:${booking.id}`,
+    JSON.stringify({
+        bookingId: booking.id,
+        eventId: Number(eventId),
+        seatIds: sortedSeatIds,
+    }),
+    {
+        EX: 600,
+    }
+);
+```
+
+Redis automatically removes the key when the TTL reaches zero.
+
+---
+
+# Phase 17 — PostgreSQL vs Redis Responsibility
+
+This distinction is important.
+
+## PostgreSQL
+
+Stores the actual state:
+
+```text
+Booking status
+Seat status
+Payment status
+Ticket status
+```
+
+PostgreSQL is the source of truth.
+
+---
+
+## Redis
+
+Stores temporary hold information:
+
+```text
+booking → temporarily held seats
+```
+
+with TTL.
+
+Redis is not responsible for permanently deciding whether a seat is booked.
+
+---
+
+# Phase 18 — BullMQ Background Jobs
+
+Redis alone does not perform our database cleanup.
+
+BullMQ is used to schedule background jobs.
+
+Queue:
+
+```text
+seat-hold
+```
+
+When a booking is created, a delayed job is added.
+
+Example:
+
+```js
+await holdQueue.add(
+    "release-hold",
+    {
+        bookingId: booking.id,
+    },
+    {
+        delay: delayMs,
+    }
+);
+```
+
+The job runs after the booking hold expires.
+
+---
+
+# Phase 19 — BullMQ Worker
+
+The worker receives the delayed job.
+
+Flow:
+
+```text
+BullMQ Job
+   ↓
+Find booking
+   ↓
+Lock booking
+   ↓
+Check status
+   ↓
+If still pending
+   ↓
+Mark booking expired
+   ↓
+Release held seats
+   ↓
+COMMIT
+   ↓
+Delete Redis hold
+```
+
+The worker uses:
+
+```sql
+FOR UPDATE
+```
+
+on the booking.
+
+This prevents another operation from changing the booking simultaneously without coordination.
+
+---
+
+# Phase 20 — Important Worker Safety Check
+
+The worker does not blindly expire every booking.
+
+It checks:
+
+```text
+booking.status === pending
+```
+
+If the booking is already:
+
+```text
+confirmed
+cancelled
+expired
+```
+
+the worker does nothing.
+
+Example:
+
+```text
+Payment succeeds
+      ↓
+Booking → confirmed
+      ↓
+Old expiration job runs
+      ↓
+Worker sees confirmed
+      ↓
+No action
+```
+
+This is important because the delayed BullMQ job may still exist even after the booking is confirmed.
+
+---
+
+# Phase 21 — Redis Cleanup After Expiration
+
+After PostgreSQL successfully commits:
+
+```text
+booking → expired
+seats → available
+```
+
+the worker removes the Redis key:
+
+```js
+await redisClient.del(
+    `seatvault:hold:booking:${bookingId}`
+);
+```
+
+Important principle:
+
+```text
+Database update first
+        ↓
+COMMIT
+        ↓
+Redis cleanup
+```
+
+This avoids deleting the temporary Redis information before the database state is safely updated.
+
+---
+
+# Phase 22 — Payment Flow
+
+The payment system is currently simulated for learning.
+
+There are two endpoints:
+
+```text
+POST /api/bookings/:bookingId/payment
+POST /api/bookings/webhook
+```
+
+---
+
+# Phase 23 — Creating a Payment
+
+When a user wants to pay:
+
+```text
+Booking
+   ↓
+Lock booking
+   ↓
+Check pending
+   ↓
+Check expiration
+   ↓
+Create payment
+   ↓
+COMMIT
+```
+
+The payment initially has:
+
+```text
+status = pending
+```
+
+A transaction ID is generated.
+
+Example:
+
+```text
+txn_1790771066812
+```
+
+---
+
+# Phase 24 — Payment Webhook
+
+The webhook simulates a payment provider notifying our backend.
+
+Request contains:
+
+```json
+{
+    "transactionId": "txn_1790771066812",
+    "status": "successful"
+}
+```
+
+The backend finds the payment using the transaction ID.
+
+---
+
+# Phase 25 — Payment Webhook Transaction
+
+Successful payment flow:
+
+```text
+Webhook
+   ↓
+Find payment
+   ↓
+Lock payment
+   ↓
+Check current payment state
+   ↓
+Lock booking
+   ↓
+Check booking
+   ↓
+Check expiration
+   ↓
+Payment → successful
+   ↓
+Booking → confirmed
+   ↓
+Seats → booked
+   ↓
+COMMIT
+```
+
+After successful database commit:
+
+```text
+Redis hold → deleted
+```
+
+---
+
+# Phase 26 — Webhook Idempotency
+
+A payment webhook can potentially be received more than once.
+
+Example:
+
+```text
+Webhook 1
+successful
+
+Webhook 2
+successful
+```
+
+Without protection, the second request might process the payment again.
+
+The implementation checks:
+
+```text
+if payment.status === successful
+```
+
+then returns:
+
+```json
+{
+    "message": "Payment already processed"
+}
+```
+
+Therefore duplicate webhook delivery does not repeat the payment processing.
+
+This introduced the concept of:
+
+> **Idempotency**
+
+An operation is idempotent when repeating the same operation does not incorrectly create another state change.
+
+---
+
+# Phase 27 — Payment Testing
+
+A successful payment was tested for Booking 11.
+
+Payment:
+
+```text
+booking_id = 11
+amount = 998
+status = successful
+transaction_id = txn_1790771066812
+```
+
+Webhook response:
+
+```json
+{
+    "message": "Payment processed successfully"
+}
+```
+
+Sending the same webhook again returned:
+
+```json
+{
+    "message": "Payment already processed"
+}
+```
+
+Final database state:
+
+```text
+Booking 11
+    status = confirmed
+
+Payment
+    status = successful
+
+Seat 4
+    status = booked
+
+Seat 5
+    status = booked
+```
+
+This confirmed that the payment flow and basic webhook idempotency worked.
+
+---
+
+# Phase 28 — Ticket Generation
+
+After successful booking confirmation, tickets can be generated.
+
+A booking can contain multiple seats.
+
+Therefore ticket creation works at the:
+
+```text
+booking_seat
+```
+
+level.
+
+Route:
+
+```text
+POST /api/bookings/:bookingId/seats/:bookingSeatId/ticket
+```
+
+---
+
+# Phase 29 — Ticket Creation Flow
+
+The ticket controller:
+
+```text
+Find booking
+   ↓
+Lock booking
+   ↓
+Check booking = confirmed
+   ↓
+Find booking seat
+   ↓
+Check whether ticket already exists
+   ↓
+Generate unique ticket code
+   ↓
+Create ticket
+   ↓
+COMMIT
+```
+
+Ticket code example:
+
+```text
+TKT-A2335C87A3BA8533
+```
+
+The ticket currently stores the ticket code as:
+
+```text
+qr_code_data
+```
+
+Actual QR image generation has not yet been implemented.
+
+---
+
+# Phase 30 — Ticket Idempotency
+
+Before creating a ticket, the controller checks:
+
+```sql
+SELECT ...
+FROM tickets
+WHERE booking_seat_id = $1
+FOR UPDATE;
+```
+
+If a ticket already exists:
+
+```text
+Ticket already exists
+```
+
+is returned instead of creating another ticket.
+
+This prevents multiple tickets from being created for the same booked seat.
+
+---
+
+# Phase 31 — Ticket Testing
+
+Booking 11 contained:
+
+```text
+Booking Seat 19 → Seat 4
+Booking Seat 20 → Seat 5
+```
+
+Tickets created:
+
+```text
+Ticket 1
+Booking Seat 19
+Seat 4
+Status: valid
+```
+
+```text
+Ticket 2
+Booking Seat 20
+Seat 5
+Status: valid
+```
+
+Repeating the request for Booking Seat 20 returned:
+
+```json
+{
+    "message": "Ticket already exists"
+}
+```
+
+Final relationship:
+
+```text
+Booking 11
+   │
+   ├── Booking Seat 19
+   │       └── Ticket 1
+   │
+   └── Booking Seat 20
+           └── Ticket 2
+```
+
+---
+
+# Phase 32 — Booking Cancellation
+
+A pending booking can be cancelled manually.
+
+Important rule:
+
+```text
+Only PENDING bookings can be cancelled.
+```
+
+Confirmed bookings are not cancelled through this endpoint because confirmed bookings require a refund flow.
+
+Route:
+
+```text
+POST /api/events/:eventId/bookings/:bookingId/cancel
+```
+
+---
+
+# Phase 33 — Cancellation Transaction
+
+Cancellation flow:
+
+```text
+BEGIN
+   ↓
+Find booking
+   ↓
+Lock booking
+   ↓
+Check event
+   ↓
+Check status = pending
+   ↓
+Booking → cancelled
+   ↓
+Held seats → available
+   ↓
+COMMIT
+   ↓
+Delete Redis hold
+```
+
+If any database operation fails:
+
+```text
+ROLLBACK
+```
+
+---
+
+# Phase 34 — Cancellation Rules
+
+The cancellation endpoint checks:
+
+### 1. Booking exists
+
+If not:
+
+```text
+404 Booking not found
+```
+
+### 2. Booking belongs to the event
+
+If not:
+
+```text
+400 Booking does not belong to this event
+```
+
+### 3. Booking is pending
+
+If booking is already:
+
+```text
+confirmed
+expired
+cancelled
+refunded
+```
+
+the cancellation is rejected.
+
+Example:
+
+```text
+Booking cannot be cancelled because it is confirmed
+```
+
+---
+
+# Phase 35 — Cancellation and Seat Release
+
+When a pending booking is cancelled:
+
+```text
+Booking
+pending → cancelled
+```
+
+and related seats:
+
+```text
+held → available
+```
+
+Only seats belonging to that booking are released.
+
+The query uses `booking_seats` to find the correct event seats.
+
+This prevents unrelated seats from being released.
+
+---
+
+# Phase 36 — Cancellation and Redis
+
+After the database transaction commits:
+
+```js
+await redisClient.del(
+    `seatvault:hold:booking:${bookingId}`
+);
+```
+
+Therefore the temporary Redis hold is removed.
+
+Final state:
+
+```text
+PostgreSQL:
+booking = cancelled
+seat = available
+
+Redis:
+hold key = deleted
+```
+
+---
+
+# Phase 37 — Cancellation Testing
+
+The cancellation flow was tested successfully.
+
+All three checks passed:
+
+### Booking
+
+```text
+pending → cancelled
+```
+
+### Seat
+
+```text
+held → available
+```
+
+### Redis
+
+```text
+seatvault:hold:booking:<id>
+        ↓
+(nil)
+```
+
+Therefore the pending booking cancellation flow is working.
+
+---
+
+# Important Concepts Learned So Far
+
+## 1. Relational Database Design
+
+Learned how to model relationships between:
+
+```text
+Users
+Venues
+Events
+Seats
+Event Seats
+Bookings
+Booking Seats
+Payments
+Tickets
+```
+
+---
+
+## 2. Database Constraints
+
+Used:
+
+```text
+PRIMARY KEY
+FOREIGN KEY
+UNIQUE
+CHECK
+NOT NULL
+```
+
+These constraints help protect data integrity at the database level.
+
+---
+
+## 3. Transactions
+
+Used:
+
+```sql
+BEGIN
+COMMIT
+ROLLBACK
+```
+
+Transactions make multiple database operations behave as one atomic operation.
+
+---
+
+## 4. Row-Level Locking
+
+Used:
+
+```sql
+FOR UPDATE
+```
+
+to prevent concurrent operations from incorrectly modifying the same booking or seat.
+
+---
+
+## 5. Concurrency Control
+
+Seat booking introduced the real-world problem:
+
+```text
+Two users
+   ↓
+Same seat
+   ↓
+Same time
+```
+
+Row-level locking prevents double booking.
+
+---
+
+## 6. Redis TTL
+
+Redis stores temporary booking hold information with:
+
+```text
+600 seconds
+```
+
+TTL allows temporary data to automatically expire.
+
+---
+
+## 7. BullMQ
+
+BullMQ handles delayed background work.
+
+Used for:
+
+```text
+Booking expiration
+```
+
+The worker updates PostgreSQL and releases the seats.
+
+---
+
+## 8. PostgreSQL vs Redis
+
+### PostgreSQL
+
+Source of truth.
+
+### Redis
+
+Temporary/fast-access storage.
+
+### BullMQ
+
+Background job processing.
+
+The three systems have different responsibilities.
+
+---
+
+## 9. Webhooks
+
+Payment confirmation is handled through a webhook simulation.
+
+The backend receives the payment provider's result and updates the booking.
+
+---
+
+## 10. Idempotency
+
+Payment webhook:
+
+```text
+successful → successful
+```
+
+does not process the payment twice.
+
+Ticket creation:
+
+```text
+same booking seat → same ticket
+```
+
+does not create duplicate tickets.
+
+---
+
+## 11. Booking State Machine
+
+Current lifecycle:
+
+```text
+                    ┌──→ EXPIRED
+                    │
+PENDING ────────────┼──→ CANCELLED
+   │                │
+   │                └──→ CONFIRMED
+   │                       │
+   │                       └──→ REFUNDED
+   │
+   └── payment success → CONFIRMED
+```
+
+The `CONFIRMED → REFUNDED` flow is the next lifecycle feature to implement.
+
+---
+
+# Current Architecture
+
+```text
+                    ┌───────────────┐
+                    │    Client     │
+                    └───────┬───────┘
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │    Express    │
+                    │      API      │
+                    └───────┬───────┘
+                            │
+              ┌─────────────┼─────────────┐
+              │             │             │
+              ▼             ▼             ▼
+         PostgreSQL       Redis         BullMQ
+         Source of       Temporary      Background
+          Truth           Holds           Jobs
+              │             │             │
+              │             │             ▼
+              │             │        Hold Worker
+              │             │             │
+              └─────────────┴─────────────┘
+                            │
+                            ▼
+                    Booking Lifecycle
+```
+
+---
+
+# Current Booking Lifecycle
+
+```text
+PENDING
+   │
+   ├── Payment Success ──────→ CONFIRMED
+   │                              │
+   │                              └── Refund → REFUNDED
+   │
+   ├── Timeout ──────────────→ EXPIRED
+   │
+   └── User Cancellation ────→ CANCELLED
+```
+
+---
+
+# Completed Features
+
+- [x] Project workspace setup
+- [x] PostgreSQL setup
+- [x] Relational database schema
+- [x] Users
+- [x] Venues
+- [x] Events
+- [x] Physical seats
+- [x] Event-specific seat inventory
+- [x] Bookings
+- [x] Booking seats
+- [x] Payments
+- [x] Per-seat tickets
+- [x] PostgreSQL transactions
+- [x] Row-level locking
+- [x] Temporary booking holds
+- [x] Redis integration
+- [x] Redis TTL
+- [x] BullMQ delayed jobs
+- [x] Automatic booking expiration
+- [x] Seat release after expiration
+- [x] Payment webhook simulation
+- [x] Basic webhook idempotency
+- [x] Ticket idempotency
+- [x] Pending booking cancellation
+- [x] Redis cleanup after cancellation
+- [x] Redis cleanup after successful payment
+- [x] Redis cleanup after expiration
+
+---
+
+# Important Testing Method
+
+API testing is done using:
+
+```text
+Postman
+```
+
+Database verification is done using:
+
+```text
+psql
+```
+
+Examples of verification include checking:
+
+```sql
+SELECT * FROM bookings;
+
+SELECT * FROM event_seats;
+
+SELECT * FROM payments;
+
+SELECT * FROM tickets;
+```
+
+and joining related tables to verify the complete booking state.
+
+---
+
+# Current Project Status
+
+The following booking lifecycle transitions are implemented:
+
+```text
+PENDING
+   ├──→ CONFIRMED
+   ├──→ EXPIRED
+   └──→ CANCELLED
+```
+
+Next planned transition:
+
+```text
+CONFIRMED
+   └──→ REFUNDED
+```
+
+The refund flow will need to keep these states consistent:
+
+```text
+Payment
+    successful → refunded
+
+Booking
+    confirmed → refunded
+
+Event Seat
+    booked → available
+
+Ticket
+    valid → cancelled
+```
+
+This will be implemented as the next major booking-lifecycle feature.
+
+---
+
+# Git Checkpoint
+
+The latest completed work includes the pending booking cancellation flow.
+
+Recommended checkpoint:
+
+```bash
+git add .
+git commit -m "feat: implement pending booking cancellation"
+git push
+```
+
+> This log represents the completed learning up to the pending-booking cancellation checkpoint. The refund phase has not yet been implemented.
+```

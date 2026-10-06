@@ -213,7 +213,7 @@ const createBooking = async (req, res) => {
     }
       );
 
-      
+
 
         const delayMs =
     new Date(booking.expires_at).getTime() - Date.now();
@@ -319,9 +319,96 @@ const confirmBooking = async (req, res) => {
         client.release();
     }
 };
+
+
+const cancelBooking = async (req, res) => {
+    const { eventId, bookingId } = req.params;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query("BEGIN");
+
+        // 1. Find and lock the booking
+        const result = await client.query(
+            `SELECT id, user_id, event_id, total_amount, status
+             FROM bookings
+             WHERE id = $1
+             FOR UPDATE`,
+            [bookingId]
+        );
+
+        if (result.rows.length === 0) {
+            await client.query("ROLLBACK");
+
+            return res.status(404).json({
+                message: "Booking not found",
+            });
+        }
+
+        const booking = result.rows[0];
+
+        // 2. Make sure booking belongs to this event
+        if (Number(booking.event_id) !== Number(eventId)) {
+            await client.query("ROLLBACK");
+
+            return res.status(400).json({
+                message: "Booking does not belong to this event",
+            });
+        }
+
+        // 3. Only pending bookings can be cancelled here
+        if (booking.status !== "pending") {
+            await client.query("ROLLBACK");
+
+            return res.status(409).json({
+                message: `Booking cannot be cancelled because it is ${booking.status}`,
+            });
+        }
+
+        // 4. Cancel the booking
+        await client.query(
+            `UPDATE bookings
+             SET status = 'cancelled',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1`,
+            [bookingId]
+        );
+
+        // 5. Release the held seats
+        await client.query(
+            `UPDATE event_seats AS es
+             SET status = 'available',
+                 updated_at = CURRENT_TIMESTAMP
+             FROM booking_seats AS bs
+             WHERE es.id = bs.event_seat_id
+               AND bs.booking_id = $1
+               AND es.status = 'held'`,
+            [bookingId]
+        );
+
+        await client.query("COMMIT");
+
+        // 6. Remove temporary Redis hold
+        await redisClient.del(
+            `seatvault:hold:booking:${bookingId}`
+        );
+
+        return res.status(200).json({
+            message: "Booking cancelled successfully",
+            bookingId: booking.id,
+        });
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+};
 module.exports = {
     getAvailableSeats,
     holdSeat,
     createBooking,
     confirmBooking,
+    cancelBooking,
 };
